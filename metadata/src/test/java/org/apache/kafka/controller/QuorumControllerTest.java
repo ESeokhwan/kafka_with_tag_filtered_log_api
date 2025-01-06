@@ -60,7 +60,6 @@ import org.apache.kafka.common.metadata.RegisterBrokerRecord.BrokerEndpointColle
 import org.apache.kafka.common.metadata.RegisterControllerRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.metadata.UnfenceBrokerRecord;
-import org.apache.kafka.common.metadata.ZkMigrationStateRecord;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.AlterPartitionRequest;
@@ -99,7 +98,6 @@ import org.apache.kafka.metadata.RecordTestUtils.ImageDeltaPair;
 import org.apache.kafka.metadata.RecordTestUtils.TestThroughAllIntermediateImagesLeadingToFinalImageHelper;
 import org.apache.kafka.metadata.authorizer.StandardAuthorizer;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
-import org.apache.kafka.metadata.migration.ZkMigrationState;
 import org.apache.kafka.metadata.util.BatchFileWriter;
 import org.apache.kafka.metalog.LocalLogManager;
 import org.apache.kafka.metalog.LocalLogManagerTestEnv;
@@ -107,7 +105,7 @@ import org.apache.kafka.raft.Batch;
 import org.apache.kafka.raft.OffsetAndEpoch;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
-import org.apache.kafka.server.common.Features;
+import org.apache.kafka.server.common.Feature;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.server.common.TopicIdPartition;
@@ -166,6 +164,7 @@ import static org.apache.kafka.metadata.LeaderConstants.NO_LEADER;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -353,7 +352,7 @@ public class QuorumControllerTest {
     }
 
     @Test
-    public void testUncleanShutdownBroker() throws Throwable {
+    public void testUncleanShutdownBrokerElrEnabled() throws Throwable {
         List<Integer> allBrokers = Arrays.asList(1, 2, 3);
         short replicationFactor = (short) allBrokers.size();
         long sessionTimeoutMillis = 500;
@@ -363,7 +362,6 @@ public class QuorumControllerTest {
                 build();
             QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv).
                 setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis)).
-
                 setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_4_0_IV1, "test-provided bootstrap ELR enabled")).
                 build()
         ) {
@@ -479,6 +477,100 @@ public class QuorumControllerTest {
             assertEquals(0, partition.elr.length, partition.toString());
             assertEquals(0, partition.lastKnownElr.length, partition.toString());
             assertEquals(brokerToBeTheLeader, partition.leader, partition.toString());
+        }
+    }
+
+    @Test
+    public void testUncleanShutdownElrDisabled() throws Exception {
+        List<Integer> allBrokers = Arrays.asList(1, 2, 3);
+        short replicationFactor = (short) allBrokers.size();
+        long sessionTimeoutMillis = 500;
+
+        try (
+            LocalLogManagerTestEnv logEnv = new LocalLogManagerTestEnv.Builder(1).
+                build();
+            QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(logEnv)
+                .setControllerBuilderInitializer(controllerBuilder ->
+                    controllerBuilder.setFenceStaleBrokerIntervalNs(TimeUnit.SECONDS.toNanos(15)))
+                .setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis))
+                .setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_4_0_IV0, "test-provided bootstrap ELR not supported"))
+                .build()
+        ) {
+            ListenerCollection listeners = new ListenerCollection();
+            listeners.add(new Listener().setName("PLAINTEXT").setHost("localhost").setPort(9092));
+            QuorumController active = controlEnv.activeController();
+            Map<Integer, Long> brokerEpochs = new HashMap<>();
+            BrokerRegistrationRequestData.FeatureCollection features =
+                brokerFeaturesPlusFeatureVersions(MetadataVersion.IBP_3_0_IV1, MetadataVersion.IBP_4_0_IV0,
+                    Map.of(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_0.featureLevel()));
+            for (Integer brokerId : allBrokers) {
+                CompletableFuture<BrokerRegistrationReply> reply = active.registerBroker(
+                    anonymousContextFor(ApiKeys.BROKER_REGISTRATION),
+                    new BrokerRegistrationRequestData().
+                        setBrokerId(brokerId).
+                        setClusterId(active.clusterId()).
+                        setFeatures(features).
+                        setIncarnationId(Uuid.randomUuid()).
+                        setLogDirs(Collections.singletonList(Uuid.randomUuid())).
+                        setListeners(listeners));
+                brokerEpochs.put(brokerId, reply.get().epoch());
+            }
+
+            // Brokers are only registered and should still be fenced
+            allBrokers.forEach(brokerId ->
+                assertFalse(active.clusterControl().isUnfenced(brokerId), "Broker " + brokerId + " should have been fenced")
+            );
+
+            // Unfence all brokers and create a topic foo
+            sendBrokerHeartbeatToUnfenceBrokers(active, allBrokers, brokerEpochs);
+            CreateTopicsRequestData createTopicsRequestData = new CreateTopicsRequestData().setTopics(
+                new CreatableTopicCollection(Collections.singleton(
+                    new CreatableTopic().setName("foo").setNumPartitions(1).
+                        setReplicationFactor(replicationFactor)).iterator()));
+            CreateTopicsResponseData createTopicsResponseData = active.createTopics(
+                ANONYMOUS_CONTEXT, createTopicsRequestData,
+                Collections.singleton("foo")).get();
+            assertEquals(Errors.NONE, Errors.forCode(createTopicsResponseData.topics().find("foo").errorCode()));
+            Uuid topicIdFoo = createTopicsResponseData.topics().find("foo").topicId();
+
+            // wait for brokers to become inactive
+            active.time().sleep(sessionTimeoutMillis);
+
+            // unclean shutdown for each replica
+            for (int i = 0; i < (int) replicationFactor; i++) {
+                // Verify that ELR is disabled
+                PartitionRegistration partition = active.replicationControl().getPartition(topicIdFoo, 0);
+                assertEquals(0, partition.elr.length, partition.toString());
+                assertEquals(0, partition.lastKnownElr.length, partition.toString());
+
+                boolean lastStandingIsr = i == (replicationFactor - 1);
+                int prevLeader = partition.leader;
+                int prevLeaderEpoch = partition.leaderEpoch;
+                // Unclean shutdown should remove the broker from the ISR and reassign leadership
+                active.registerBroker(
+                    anonymousContextFor(ApiKeys.BROKER_REGISTRATION),
+                    new BrokerRegistrationRequestData().
+                        setBrokerId(prevLeader).
+                        setClusterId(active.clusterId()).
+                        setFeatures(features).
+                        setIncarnationId(Uuid.randomUuid()).
+                        setLogDirs(Collections.singletonList(Uuid.randomUuid())).
+                        setListeners(listeners)).get();
+                partition = active.replicationControl().getPartition(topicIdFoo, 0);
+                // leader should always change, leader epoch should always be incremented
+                int currentLeader = partition.leader;
+                int currentLeaderEpoch = partition.leaderEpoch;
+                assertNotEquals(currentLeader, prevLeader);
+                assertNotEquals(currentLeaderEpoch, prevLeaderEpoch);
+                // if the broker is not the last standing ISR, it should be removed from the ISR
+                if (lastStandingIsr) {
+                    assertArrayEquals(new int[]{prevLeader}, partition.isr);
+                    assertEquals(NO_LEADER, currentLeader);
+                } else {
+                    List<Integer> isr = Arrays.stream(partition.isr).boxed().toList();
+                    assertFalse(isr.contains(prevLeader));
+                }
+            }
         }
     }
 
@@ -696,7 +788,7 @@ public class QuorumControllerTest {
             if (brokerMaxSupportedKraftVersion != 0) {
                 brokerFeatures.add(new BrokerRegistrationRequestData.Feature()
                     .setName(KRaftVersion.FEATURE_NAME)
-                    .setMinSupportedVersion(Features.KRAFT_VERSION.minimumProduction())
+                    .setMinSupportedVersion(Feature.KRAFT_VERSION.minimumProduction())
                     .setMaxSupportedVersion(brokerMaxSupportedKraftVersion));
             }
             BrokerRegistrationRequestData request = new BrokerRegistrationRequestData().
@@ -720,7 +812,7 @@ public class QuorumControllerTest {
                 BrokerRegistrationReply reply = active.registerBroker(
                     ANONYMOUS_CONTEXT,
                     request).get();
-                assertTrue(reply.epoch() >= 5, "Unexpected broker epoch " + reply.epoch());
+                assertTrue(reply.epoch() >= 4, "Unexpected broker epoch " + reply.epoch());
             }
         }
     }
@@ -747,7 +839,7 @@ public class QuorumControllerTest {
                         Map.of(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_1.featureLevel()))).
                     setLogDirs(Collections.singletonList(Uuid.fromString("vBpaRsZVSaGsQT53wtYGtg"))).
                     setListeners(listeners));
-            assertEquals(5L, reply.get().epoch());
+            assertEquals(4L, reply.get().epoch());
             CreateTopicsRequestData createTopicsRequestData =
                 new CreateTopicsRequestData().setTopics(
                     new CreatableTopicCollection(Collections.singleton(
@@ -763,7 +855,7 @@ public class QuorumControllerTest {
                         get().topics().find("foo").errorMessage());
             assertEquals(new BrokerHeartbeatReply(true, false, false, false),
                 active.processBrokerHeartbeat(ANONYMOUS_CONTEXT, new BrokerHeartbeatRequestData().
-                        setWantFence(false).setBrokerEpoch(5L).setBrokerId(0).
+                        setWantFence(false).setBrokerEpoch(4L).setBrokerId(0).
                         setCurrentMetadataOffset(100000L)).get());
             assertEquals(Errors.NONE.code(), active.createTopics(ANONYMOUS_CONTEXT,
                 createTopicsRequestData, Collections.singleton("foo")).
@@ -867,10 +959,10 @@ public class QuorumControllerTest {
                                 Arrays.asList(new CreatableReplicaAssignment().
                                     setPartitionIndex(0).
                                     setBrokerIds(Arrays.asList(0, 1, 2)),
-                                new CreatableReplicaAssignment().
-                                    setPartitionIndex(1).
-                                    setBrokerIds(Arrays.asList(1, 2, 0))).
-                                        iterator()))).iterator())),
+                                    new CreatableReplicaAssignment().
+                                        setPartitionIndex(1).
+                                        setBrokerIds(Arrays.asList(1, 2, 0))).
+                                            iterator()))).iterator())),
                 Collections.singleton("foo")).get();
             fooId = fooData.topics().find("foo").topicId();
             active.allocateProducerIds(ANONYMOUS_CONTEXT,
@@ -889,8 +981,6 @@ public class QuorumControllerTest {
             new ApiMessageAndVersion(new FeatureLevelRecord().
                 setName(MetadataVersion.FEATURE_NAME).
                 setFeatureLevel(MetadataVersion.IBP_3_7_IV0.featureLevel()), (short) 0),
-            new ApiMessageAndVersion(new ZkMigrationStateRecord().
-                setZkMigrationState((byte) 0), (short) 0),
             new ApiMessageAndVersion(new EndTransactionRecord(), (short) 0),
             new ApiMessageAndVersion(new RegisterControllerRecord().
                 setControllerId(0).
@@ -1248,7 +1338,7 @@ public class QuorumControllerTest {
     }
 
     private static final List<ApiMessageAndVersion> PRE_PRODUCTION_RECORDS =
-            Collections.unmodifiableList(Arrays.asList(
+            List.of(
                 new ApiMessageAndVersion(new RegisterBrokerRecord().
                         setBrokerEpoch(42).
                         setBrokerId(123).
@@ -1262,7 +1352,7 @@ public class QuorumControllerTest {
                 new ApiMessageAndVersion(new TopicRecord().
                         setName("bar").
                         setTopicId(Uuid.fromString("cxBT72dK4si8Ied1iP4wBA")),
-                        (short) 0)));
+                        (short) 0));
 
     private static final BootstrapMetadata COMPLEX_BOOTSTRAP = BootstrapMetadata.fromRecords(
             Arrays.asList(
@@ -1383,10 +1473,7 @@ public class QuorumControllerTest {
                         appender)).getMessage());
     }
 
-    FeatureControlManager getActivationRecords(
-        MetadataVersion metadataVersion,
-        Optional<ZkMigrationState> stateInLog
-    ) {
+    FeatureControlManager getActivationRecords(MetadataVersion metadataVersion) {
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
         FeatureControlManager featureControlManager = new FeatureControlManager.Builder()
                 .setSnapshotRegistry(snapshotRegistry)
@@ -1395,10 +1482,9 @@ public class QuorumControllerTest {
 
         ControllerResult<Void> result = ActivationRecordsGenerator.generate(
             msg -> { },
-            stateInLog.isEmpty(),
+            true,
             -1L,
             BootstrapMetadata.fromVersion(metadataVersion, "test"),
-            stateInLog.orElse(ZkMigrationState.NONE),
             metadataVersion);
         RecordTestUtils.replayAll(featureControlManager, result.records());
         return featureControlManager;
@@ -1408,34 +1494,23 @@ public class QuorumControllerTest {
     public void testActivationRecords33() {
         FeatureControlManager featureControl;
 
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_3_IV0, Optional.empty());
+        featureControl = getActivationRecords(MetadataVersion.IBP_3_3_IV0);
         assertEquals(MetadataVersion.IBP_3_3_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_3_IV0, Optional.of(ZkMigrationState.NONE));
-        assertEquals(MetadataVersion.IBP_3_3_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
     }
 
     @Test
     public void testActivationRecords34() {
         FeatureControlManager featureControl;
 
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.empty());
+        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0);
         assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
-
-        featureControl = getActivationRecords(MetadataVersion.IBP_3_4_IV0, Optional.of(ZkMigrationState.NONE));
-        assertEquals(MetadataVersion.IBP_3_4_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
     }
 
     @Test
     public void testActivationRecordsNonEmptyLog() {
         FeatureControlManager featureControl = getActivationRecords(
-            MetadataVersion.IBP_3_9_IV0, Optional.empty());
+            MetadataVersion.IBP_3_9_IV0);
         assertEquals(MetadataVersion.IBP_3_9_IV0, featureControl.metadataVersion());
-        assertEquals(ZkMigrationState.NONE, featureControl.zkMigrationState());
     }
 
     @Test
@@ -1445,7 +1520,6 @@ public class QuorumControllerTest {
             true,
             0L,
             BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_6_IV1, "test"),
-            ZkMigrationState.NONE,
             MetadataVersion.IBP_3_6_IV1);
         assertFalse(result.isAtomic());
         assertTrue(RecordTestUtils.recordAtIndexAs(
@@ -1494,7 +1568,6 @@ public class QuorumControllerTest {
             false,
             offsetControlManager.transactionStartOffset(),
             BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_6_IV1, "test"),
-            ZkMigrationState.NONE,
             MetadataVersion.IBP_3_6_IV1);
 
         assertTrue(result.isAtomic());
@@ -1518,7 +1591,6 @@ public class QuorumControllerTest {
                 false,
                 offsetControlManager.transactionStartOffset(),
                 BootstrapMetadata.fromVersion(MetadataVersion.IBP_3_6_IV0, "test"),
-                ZkMigrationState.NONE,
                 MetadataVersion.IBP_3_6_IV0)
         );
     }

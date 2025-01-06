@@ -174,7 +174,7 @@ public class KafkaClusterTestKit implements AutoCloseable {
             props.put(QuorumConfig.QUORUM_VOTERS_CONFIG, quorumVoterStringBuilder.toString());
 
             // reduce log cleaner offset map memory usage
-            props.put(CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_SIZE_PROP, "2097152");
+            props.putIfAbsent(CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_SIZE_PROP, "2097152");
 
             // Add associated broker node property overrides
             if (brokerNode != null) {
@@ -539,15 +539,14 @@ public class KafkaClusterTestKit implements AutoCloseable {
 
     public Controller waitForActiveController() throws InterruptedException {
         AtomicReference<Controller> active = new AtomicReference<>(null);
-        TestUtils.retryOnExceptionWithTimeout(() -> {
+        TestUtils.waitForCondition(() -> {
             for (ControllerServer controllerServer : controllers.values()) {
                 if (controllerServer.controller().isActive()) {
                     active.set(controllerServer.controller());
                 }
             }
-            if (active.get() == null)
-                throw new RuntimeException("Controller not active");
-        });
+            return active.get() != null;
+        }, 60_000, "Controller not active");
         return active.get();
     }
 
