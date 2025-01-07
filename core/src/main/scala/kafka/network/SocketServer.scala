@@ -763,6 +763,7 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
                   currentProcessorIndex = currentProcessorIndex % processors.length
                   processors(currentProcessorIndex)
                 }
+                infoWithTag("expr-fetch-on-cold", s"Processor ${processor.id} is assigned to channel ${socketChannel}")
                 currentProcessorIndex += 1
               } while (!assignNewConnection(socketChannel, processor, retriesLeft == 0))
             }
@@ -1149,6 +1150,7 @@ private[kafka] class Processor(
                       apiVersionsRequest.data.clientSoftwareVersion))
                   }
                 }
+                infoWithTag("expr-fetch-on-cold", s"ProcessorID: ${id} / Request: ${context}")
                 requestChannel.sendRequest(req)
                 selector.mute(connectionId)
                 handleChannelMuteEvent(connectionId, ChannelMuteEvent.REQUEST_RECEIVED)
