@@ -1,8 +1,10 @@
 package kafka.interceptor
 
-import kafka.monitor.writer.{ConsoleMonitorLogWriteStrategy, MonitorLogWriter}
-import kafka.monitor.{MonitorLog, MonitorQueue}
 import kafka.network.RequestChannel
+import moniq.IMonitorLog
+import moniq.writer.{BatchPolicy, MonitorLogWriter}
+import moniq.writer.strategy.IMonitorLogWriteStrategy
+import moniq.{MonitorLog, MonitorQueue}
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.record.MemoryRecords
 import org.apache.kafka.common.requests.ProduceRequest
@@ -13,6 +15,35 @@ import java.util.concurrent.atomic.AtomicLong
 import scala.jdk.CollectionConverters.ConcurrentMapHasAsScala
 
 class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBrokerInterceptor {
+
+  private final class KafkaLogWriteStrategy extends IMonitorLogWriteStrategy {
+    private val logger = logContext.logger(classOf[MonitorLoggingBrokerInterceptor])
+
+    override def write(log: IMonitorLog): Unit = {
+      if (!logger.isInfoEnabled) {
+        return
+      }
+
+      val headers = log.getHeaders
+      val values = log.getValues
+      val line = new StringBuilder
+      var index = 0
+      while (index < values.size()) {
+        if (index > 0) {
+          line.append(", ")
+        }
+        if (index < headers.size()) {
+          line.append(headers.get(index)).append(": ")
+        }
+        line.append(values.get(index))
+        index += 1
+      }
+
+      logger.info("MonitorLog -- {}", line)
+    }
+
+    override def commit(): Boolean = true
+  }
 
   class Timestamps {
     var requestedTime: Long = _
@@ -31,7 +62,7 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
   override def init(): Unit = {
     monitorQueue = new MonitorQueue()
     monitorLogWriter = new MonitorLogWriter(
-      monitorQueue, new ConsoleMonitorLogWriteStrategy(logContext, true, false), 1000)
+      monitorQueue, new KafkaLogWriteStrategy(), BatchPolicy.fixedSize(1000))
     monitorLogThread = new Thread(monitorLogWriter)
     monitorLogThread.start()
   }
@@ -59,22 +90,20 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
 
         val curNum = counter.incrementAndGet()
         val api = response.request.header.apiKey.toString
-        monitorQueue.enqueue(new MonitorLog(
+        monitorLogWriter.submit(new MonitorLog(
           api,
           curNum.toString,
           "REQUESTED",
           ts.requestedTime,
           ts.requestedTimeNano
         ))
-        monitorQueue.enqueue(new MonitorLog(
+        monitorLogWriter.submit(new MonitorLog(
           api,
           curNum.toString,
           "COMPLETED",
           ts.completedTime,
           ts.completedTimeNano
         ))
-        monitorLogWriter.notifyIfNeeded()
-//        println(s"Request $api-$curNum latencyNano: ${ts.completedTimeNano - ts.requestedTimeNano} ms")
       case None =>
     }
 
@@ -85,7 +114,7 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
         memoryRecords.batches.forEach(batch => {
           batch.forEach(record => {
             val messageId = record.value().toString
-            monitorQueue.enqueue(new MonitorLog(
+            monitorLogWriter.submit(new MonitorLog(
               "PRODUCE",
               messageId,
               "COMMITED",
@@ -95,7 +124,6 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
           })
         })
       })
-      monitorLogWriter.notifyIfNeeded()
     }
   }
 
@@ -107,7 +135,6 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
     }
 
     monitorLogWriter.gracefulShutdown()
-    monitorLogWriter.syncedNotify()
 
     try {
       monitorLogThread.join()
