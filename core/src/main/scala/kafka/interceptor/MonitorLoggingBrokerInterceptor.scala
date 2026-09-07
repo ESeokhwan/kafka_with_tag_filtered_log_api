@@ -32,7 +32,7 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
   override def init(): Unit = {
     monitorQueue = new MonitorQueue()
     monitorLogWriter = new MonitorLogWriter(
-      monitorQueue, new KafkaLogWriteStrategy(logContext), BatchPolicy.fixedSize(1000))
+      monitorQueue, new KafkaLogWriteStrategy(logContext), BatchPolicy.fixedSize(1))
     monitorLogThread = new Thread(monitorLogWriter)
     monitorLogThread.start()
   }
