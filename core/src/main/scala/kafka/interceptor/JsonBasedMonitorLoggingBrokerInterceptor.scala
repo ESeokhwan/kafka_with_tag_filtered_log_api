@@ -8,7 +8,7 @@ import moniq.{JsonBasedLatencyMonitorLog, MonitorQueue}
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.record.MemoryRecords
 import org.apache.kafka.common.requests.ProduceRequest
-import org.apache.kafka.common.utils.LogContext
+import org.apache.kafka.common.utils.{LogContext, Utils}
 
 class JsonBasedMonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBrokerInterceptor {
 
@@ -34,9 +34,12 @@ class JsonBasedMonitorLoggingBrokerInterceptor(val logContext: LogContext) exten
         val memoryRecords: MemoryRecords = partition.records.asInstanceOf[MemoryRecords]
         memoryRecords.batches.forEach(batch => {
           batch.forEach(record => {
-            monitorLogWriter.submit(
-              new JsonBasedLatencyMonitorLog(messageAdapter, record.value().toString, "NETWORK_PROCESSED", currentTime)
-            )
+            val value = record.value()
+            if (value != null) {
+              monitorLogWriter.submit(
+                new JsonBasedLatencyMonitorLog(messageAdapter, Utils.utf8(value), "NETWORK_PROCESSED", currentTime)
+              )
+            }
           })
         })
       })
@@ -54,9 +57,12 @@ class JsonBasedMonitorLoggingBrokerInterceptor(val logContext: LogContext) exten
         val memoryRecords: MemoryRecords = partition.records.asInstanceOf[MemoryRecords]
         memoryRecords.batches.forEach(batch => {
           batch.forEach(record => {
-            monitorLogWriter.submit(
-              new JsonBasedLatencyMonitorLog(messageAdapter, record.value().toString, "IO_COMMITED", currentTime)
-            )
+            val value = record.value()
+            if (value != null) {
+              monitorLogWriter.submit(
+                new JsonBasedLatencyMonitorLog(messageAdapter, Utils.utf8(value), "IO_COMMITED", currentTime)
+              )
+            }
           })
         })
       })

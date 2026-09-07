@@ -7,7 +7,7 @@ import moniq.{MonitorLog, MonitorQueue}
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.record.MemoryRecords
 import org.apache.kafka.common.requests.ProduceRequest
-import org.apache.kafka.common.utils.LogContext
+import org.apache.kafka.common.utils.{LogContext, Utils}
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
@@ -83,14 +83,16 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
         val memoryRecords: MemoryRecords = partition.records.asInstanceOf[MemoryRecords]
         memoryRecords.batches.forEach(batch => {
           batch.forEach(record => {
-            val messageId = record.value().toString
-            monitorLogWriter.submit(new MonitorLog(
-              "PRODUCE",
-              messageId,
-              "COMMITED",
-              currentTime,
-              currentTimeNano
-            ))
+            val value = record.value()
+            if (value != null) {
+              monitorLogWriter.submit(new MonitorLog(
+                "PRODUCE",
+                Utils.utf8(value),
+                "COMMITED",
+                currentTime,
+                currentTimeNano
+              ))
+            }
           })
         })
       })
