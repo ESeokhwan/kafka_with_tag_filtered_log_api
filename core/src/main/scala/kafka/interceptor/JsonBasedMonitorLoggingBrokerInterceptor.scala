@@ -2,32 +2,21 @@ package kafka.interceptor
 
 import kafka.interceptor.strategy.KafkaLogWriteStrategy
 import kafka.network.RequestChannel
+import moniq.util.{FastExtractOnlyJsonBasedLatencyMonitoringMessageAdaptor, ILatencyMonitoringMessageAdaptor}
 import moniq.writer.{BatchPolicy, MonitorLogWriter}
-import moniq.{MonitorLog, MonitorQueue}
+import moniq.{JsonBasedLatencyMonitorLog, MonitorQueue}
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.record.MemoryRecords
 import org.apache.kafka.common.requests.ProduceRequest
 import org.apache.kafka.common.utils.LogContext
 
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
-import scala.jdk.CollectionConverters.ConcurrentMapHasAsScala
+class JsonBasedMonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBrokerInterceptor {
 
-class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBrokerInterceptor {
-
-  class Timestamps {
-    var requestedTime: Long = _
-    var requestedTimeNano: Long = _
-    var completedTime: Long = _
-    var completedTimeNano: Long = _
-  }
+  private val messageAdapter: ILatencyMonitoringMessageAdaptor = new FastExtractOnlyJsonBasedLatencyMonitoringMessageAdaptor()
 
   private var monitorQueue: MonitorQueue = _
   private var monitorLogWriter: MonitorLogWriter = _
   private var monitorLogThread: Thread = _
-
-  private val requestMap = new ConcurrentHashMap[RequestChannel.Request, Timestamps]().asScala
-  private val counter: AtomicLong = new AtomicLong(0)
 
   override def init(): Unit = {
     monitorQueue = new MonitorQueue()
@@ -39,43 +28,25 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
 
   override def beforeSendRequestToQueue(request: RequestChannel.Request, connectionId: String): Unit = {
     val currentTime = System.currentTimeMillis()
-    val currentTimeNano = System.nanoTime()
-    requestMap.put(request, new Timestamps {
-      requestedTime = currentTime
-      requestedTimeNano = currentTimeNano
-    })
+    if (request.header.apiKey == ApiKeys.PRODUCE) {
+      val produceRequest = request.body[ProduceRequest]
+      produceRequest.data().topicData().forEach(topic => topic.partitionData.forEach { partition =>
+        val memoryRecords: MemoryRecords = partition.records.asInstanceOf[MemoryRecords]
+        memoryRecords.batches.forEach(batch => {
+          batch.forEach(record => {
+            monitorLogWriter.submit(
+              new JsonBasedLatencyMonitorLog(messageAdapter, record.value().toString, "NETWORK_PROCESSED", currentTime)
+            )
+          })
+        })
+      })
+    }
   }
 
   override def beforeHandleRequest(request: RequestChannel.Request): Unit = {}
 
   override def beforeSendResponseToQueue(response: RequestChannel.Response): Unit = {
     val currentTime = System.currentTimeMillis()
-    val currentTimeNano = System.nanoTime()
-
-    val timestamps = requestMap.remove(response.request)
-    timestamps match {
-      case Some(ts) =>
-        ts.completedTime = currentTime
-        ts.completedTimeNano = currentTimeNano
-
-        val curNum = counter.incrementAndGet()
-        val api = response.request.header.apiKey.toString
-        monitorLogWriter.submit(new MonitorLog(
-          api,
-          curNum.toString,
-          "REQUESTED",
-          ts.requestedTime,
-          ts.requestedTimeNano
-        ))
-        monitorLogWriter.submit(new MonitorLog(
-          api,
-          curNum.toString,
-          "COMPLETED",
-          ts.completedTime,
-          ts.completedTimeNano
-        ))
-      case None =>
-    }
 
     if (response.request.header.apiKey == ApiKeys.PRODUCE) {
       val produceRequest = response.request.body[ProduceRequest]
@@ -83,14 +54,9 @@ class MonitorLoggingBrokerInterceptor(val logContext: LogContext) extends IBroke
         val memoryRecords: MemoryRecords = partition.records.asInstanceOf[MemoryRecords]
         memoryRecords.batches.forEach(batch => {
           batch.forEach(record => {
-            val messageId = record.value().toString
-            monitorLogWriter.submit(new MonitorLog(
-              "PRODUCE",
-              messageId,
-              "COMMITED",
-              currentTime,
-              currentTimeNano
-            ))
+            monitorLogWriter.submit(
+              new JsonBasedLatencyMonitorLog(messageAdapter, record.value().toString, "IO_COMMITED", currentTime)
+            )
           })
         })
       })
