@@ -19,7 +19,7 @@ package kafka.server
 
 import kafka.coordinator.group.{CoordinatorLoaderImpl, CoordinatorPartitionWriter}
 import kafka.coordinator.transaction.TransactionCoordinator
-import kafka.interceptor.{BrokerInterceptors, MonitorLoggingBrokerInterceptor, ProduceRequestRateCheckInterceptor}
+import kafka.interceptor.{BrokerInterceptors, MonitorLoggingBrokerInterceptor, JsonBasedMonitorLoggingBrokerInterceptor, ProduceRequestRateCheckInterceptor}
 import kafka.log.LogManager
 import kafka.network.SocketServer
 import kafka.raft.KafkaRaftManager
@@ -285,6 +285,7 @@ class BrokerServer(
       unusedBrokerInterceptors = new BrokerInterceptors(Vector.empty)
 
       brokerInterceptors = new BrokerInterceptors(Vector(
+        new JsonBasedMonitorLoggingBrokerInterceptor(logContext)
         new ProduceRequestRateCheckInterceptor()
       ))
       brokerInterceptors.init()
