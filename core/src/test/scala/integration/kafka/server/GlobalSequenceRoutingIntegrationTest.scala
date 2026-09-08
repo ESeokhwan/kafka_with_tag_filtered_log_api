@@ -18,6 +18,7 @@ package kafka.server
 
 import kafka.server.IntegrationTestUtils.connectAndReceive
 import org.apache.kafka.clients.admin.NewTopic
+import org.apache.kafka.clients.consumer.{ConsumerConfig, KafkaGlobalSequenceConsumer}
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.config.ConfigResource
@@ -27,12 +28,14 @@ import org.apache.kafka.common.message.{FetchGlobalSequenceRequestData, LookupGl
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.record.Records
 import org.apache.kafka.common.requests.{FetchGlobalSequenceRequest, FetchGlobalSequenceResponse, LookupGlobalSequenceIndexRequest, LookupGlobalSequenceIndexResponse}
+import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.kafka.common.test.api.{ClusterConfigProperty, ClusterTest, Type}
 import org.apache.kafka.common.test.{ClusterInstance, TestUtils}
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinatorConfig
 import org.junit.jupiter.api.Assertions.assertEquals
 
 import java.nio.charset.StandardCharsets
+import java.time.Duration
 import java.util
 import java.util.concurrent.TimeUnit
 import scala.jdk.CollectionConverters._
@@ -219,6 +222,33 @@ class GlobalSequenceRoutingIntegrationTest {
     assertEquals("first", firstValue(fetchResponse.data.batches.get(0).records.asInstanceOf[Records]))
     assertEquals(1L, fetchResponse.data.batches.get(1).globalBaseOffset)
     assertEquals("second", firstValue(fetchResponse.data.batches.get(1).records.asInstanceOf[Records]))
+
+    val consumerConfigs = new util.HashMap[String, Object]()
+    consumerConfigs.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, cluster.bootstrapServers())
+    consumerConfigs.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, classOf[StringDeserializer].getName)
+    consumerConfigs.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, classOf[StringDeserializer].getName)
+    consumerConfigs.put(ConsumerConfig.FETCH_MAX_BYTES_CONFIG, "1")
+    val globalConsumer = new KafkaGlobalSequenceConsumer[String, String](
+      cluster.setClientSaslConfig(consumerConfigs)
+    )
+    try {
+      val firstPage = globalConsumer.fetch(dataTopic, 0L, 2L, Duration.ofSeconds(30))
+      assertEquals(1, firstPage.count())
+      assertEquals("first", firstPage.records().get(0).value())
+      assertEquals(0L, firstPage.records().get(0).globalOffset())
+      assertEquals(dataPartition, firstPage.records().get(0).physicalPartition())
+      assertEquals(0L, firstPage.records().get(0).physicalOffset())
+      assertEquals(1L, firstPage.nextGlobalOffset())
+
+      val secondPage = globalConsumer.fetch(dataTopic, firstPage.nextGlobalOffset(), 2L, Duration.ofSeconds(30))
+      assertEquals(1, secondPage.count())
+      assertEquals("second", secondPage.records().get(0).value())
+      assertEquals(1L, secondPage.records().get(0).globalOffset())
+      assertEquals(1L, secondPage.records().get(0).physicalOffset())
+      assertEquals(2L, secondPage.nextGlobalOffset())
+    } finally {
+      globalConsumer.close()
+    }
   }
 
   private def firstValue(records: Records): String = {
