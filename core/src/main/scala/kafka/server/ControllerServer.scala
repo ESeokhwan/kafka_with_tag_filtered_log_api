@@ -169,13 +169,13 @@ class ControllerServer(
 
       // For testing purposes, backdoor for unused imports
       unusedBrokerInterceptors = new BrokerInterceptors(Vector(
-        new MonitorLoggingBrokerInterceptor(logContext)
+        new MonitorLoggingBrokerInterceptor(logContext),
+        new JsonBasedMonitorLoggingBrokerInterceptor(logContext),
       ))
       unusedBrokerInterceptors = new BrokerInterceptors(Vector.empty)
 
       brokerInterceptors = new BrokerInterceptors(Vector(
         new ProduceRequestRateCheckInterceptor(),
-        new JsonBasedMonitorLoggingBrokerInterceptor(logContext),
       ))
       brokerInterceptors.init()
 
