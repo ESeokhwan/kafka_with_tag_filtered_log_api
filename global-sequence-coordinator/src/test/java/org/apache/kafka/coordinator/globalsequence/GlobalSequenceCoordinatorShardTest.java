@@ -30,6 +30,7 @@ import org.apache.kafka.coordinator.common.runtime.CoordinatorResult;
 import org.apache.kafka.coordinator.common.runtime.MockCoordinatorTimer;
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceIndexLogKey;
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceIndexLogValue;
+import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.timeline.SnapshotRegistry;
 
@@ -148,9 +149,37 @@ class GlobalSequenceCoordinatorShardTest {
 
     @Test
     void testOldPhysicalBatchRetryBuildsScanPlanFromPhysicalCheckpoint() {
+        LogContext logContext = new LogContext();
+        MockTime time = new MockTime();
+        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(logContext);
+        GlobalSequenceCoordinatorConfig config = new GlobalSequenceCoordinatorConfig(new AbstractConfig(
+            GlobalSequenceCoordinatorConfig.CONFIG_DEF,
+            Map.of(GlobalSequenceCoordinatorConfig.INDEX_CACHE_MAX_ENTRIES_CONFIG, 1)
+        ));
+        GlobalSequenceCoordinatorShard boundedShard = new GlobalSequenceCoordinatorShard(
+            logContext,
+            new GlobalSequenceStateRegistry(snapshotRegistry, 1, 2),
+            new GlobalSequenceIndexCache(config.indexCacheMaxEntries()),
+            time,
+            new MockCoordinatorTimer<>(time),
+            config,
+            mock(CoordinatorMetrics.class),
+            mock(CoordinatorMetricsShard.class)
+        );
         GlobalSequenceIndexRecord existing = new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 1, 1, 20L);
-        replay(coordinatorRecord(existing));
-        snapshotRegistry.idempotentCreateSnapshot(1L);
+        boundedShard.replay(
+            0L,
+            RecordBatch.NO_PRODUCER_ID,
+            RecordBatch.NO_PRODUCER_EPOCH,
+            coordinatorRecord(existing)
+        );
+        boundedShard.replay(
+            1L,
+            RecordBatch.NO_PRODUCER_ID,
+            RecordBatch.NO_PRODUCER_EPOCH,
+            coordinatorRecord(new GlobalSequenceIndexRecord(TOPIC_ID, 1L, 1, 0, 30L))
+        );
+        snapshotRegistry.idempotentCreateSnapshot(2L);
         GlobalSequenceAppendRequest request = request(TOPIC_ID, 1, 20L, 1);
 
         assertEquals(
@@ -160,10 +189,10 @@ class GlobalSequenceCoordinatorShardTest {
                 20L,
                 1,
                 0L,
-                1L,
+                2L,
                 7
             )),
-            shard.prepareAppend(request, 1L, 7)
+            boundedShard.prepareAppend(request, 2L, 7)
         );
     }
 
@@ -247,10 +276,9 @@ class GlobalSequenceCoordinatorShardTest {
     }
 
     @Test
-    void testReplayIsIdempotentAndRejectsConflicts() {
+    void testReplayRejectsOverlappingGlobalRanges() {
         GlobalSequenceIndexRecord existing = new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 3, 1, 20L);
         CoordinatorRecord record = coordinatorRecord(existing);
-        replay(record);
         replay(record);
 
         assertEquals(
@@ -259,10 +287,6 @@ class GlobalSequenceCoordinatorShardTest {
                 new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 3L),
                 SnapshotRegistry.LATEST_EPOCH
             )
-        );
-        assertThrows(
-            IllegalStateException.class,
-            () -> replay(coordinatorRecord(new GlobalSequenceIndexRecord(TOPIC_ID, 3L, 4, 1, 20L)))
         );
         assertThrows(
             IllegalStateException.class,
@@ -374,8 +398,8 @@ class GlobalSequenceCoordinatorShardTest {
         ));
         GlobalSequenceCoordinatorShard boundedShard = new GlobalSequenceCoordinatorShard(
             logContext,
-            new GlobalSequenceStateRegistry(snapshotRegistry, 2, 1, 1, 2),
-            new GlobalSequenceIndexCache(config.indexCacheMaxEntries()),
+            new GlobalSequenceStateRegistry(snapshotRegistry, 1, 2),
+            new GlobalSequenceIndexCache(1),
             time,
             new MockCoordinatorTimer<>(time),
             config,
@@ -410,6 +434,31 @@ class GlobalSequenceCoordinatorShardTest {
                 2
             )),
             boundedShard.prepareLookup(request, 6L, 7)
+        );
+    }
+
+    @Test
+    void testCommittedReplayMovesFromOverlayToBoundedCache() {
+        shard.onLoaded(MetadataImage.EMPTY);
+        GlobalSequenceAppendRequest firstRequest = request(TOPIC_ID, 0, 20L, 1);
+        CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> first = shard.appendIndex(
+            firstRequest,
+            0L
+        );
+        replay(first.records().get(0));
+
+        assertEquals(1, stateRegistry.uncommittedAllocationCount());
+        assertEquals(
+            new GlobalSequenceAppendResult(0L, 1, true),
+            shard.appendIndex(firstRequest, 0L).response()
+        );
+
+        shard.appendIndex(request(TOPIC_ID, 0, 21L, 1), 1L);
+
+        assertEquals(0, stateRegistry.uncommittedAllocationCount());
+        assertEquals(
+            new GlobalSequenceAppendResult(0L, 1, true),
+            shard.appendIndex(firstRequest).response()
         );
     }
 

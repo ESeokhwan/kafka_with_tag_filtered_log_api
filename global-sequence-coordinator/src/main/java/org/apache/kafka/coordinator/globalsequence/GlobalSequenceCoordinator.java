@@ -281,11 +281,12 @@ public class GlobalSequenceCoordinator {
         TopicPartition topicPartition,
         GlobalSequenceAppendRequest request
     ) {
-        return runtime.scheduleWriteOperation(
+        return runtime.scheduleWriteOperationWithEpoch(
             "append-global-sequence-index",
             topicPartition,
             Duration.ofMillis(config.commitTimeoutMs()),
-            coordinator -> coordinator.appendIndex(request)
+            (coordinator, indexLogHighWatermark, ignoredCoordinatorLeaderEpoch) ->
+                coordinator.appendIndex(request, indexLogHighWatermark)
         );
     }
 

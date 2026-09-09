@@ -129,8 +129,6 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
                     logContext,
                     new GlobalSequenceStateRegistry(
                         snapshotRegistry,
-                        config.maxLookupIndexEntries(),
-                        config.indexCacheMaxEntries(),
                         config.indexCheckpointInterval(),
                         config.indexCheckpointLevelFactor()
                     ),
@@ -162,6 +160,8 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
 
     private final CoordinatorMetricsShard metricsShard;
 
+    private boolean loading = true;
+
     GlobalSequenceCoordinatorShard(
             LogContext logContext,
             GlobalSequenceStateRegistry stateRegistry,
@@ -186,8 +186,21 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         GlobalSequenceAppendRequest request
     ) {
         GlobalSequenceStateRegistry.PreparedAppend preparedAppend = stateRegistry.prepareAppend(request);
-
+        if (!preparedAppend.duplicate()) {
+            Optional<GlobalSequenceIndexRecord> cached = indexCache.getByPhysicalBatch(request.physicalBatchId());
+            if (cached.isPresent()) {
+                return duplicateResult(cached.get(), request);
+            }
+        }
         return appendResult(preparedAppend);
+    }
+
+    CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> appendIndex(
+        GlobalSequenceAppendRequest request,
+        long indexLogHighWatermark
+    ) {
+        promoteCommittedAllocations(indexLogHighWatermark);
+        return appendIndex(request);
     }
 
     GlobalSequenceAppendPreparation prepareAppend(
@@ -195,6 +208,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         long indexLogHighWatermark,
         int coordinatorLeaderEpoch
     ) {
+        promoteCommittedAllocations(indexLogHighWatermark);
         if (stateRegistry.isNewPhysicalBatch(request, indexLogHighWatermark)) {
             return GlobalSequenceAppendPreparation.fresh();
         }
@@ -236,6 +250,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
             );
         }
 
+        promoteCommittedAllocations(currentIndexLogHighWatermark);
         GlobalSequenceAppendRequest request = plan.request();
         GlobalSequenceStateRegistry.PreparedAppend rechecked = stateRegistry.prepareAppend(request);
         if (rechecked.duplicate()) {
@@ -252,7 +267,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         if (scannedIndexRecord.isPresent()) {
             GlobalSequenceIndexRecord existing = scannedIndexRecord.get();
             GlobalSequenceAppendResult result = toDuplicateResult(existing, request);
-            indexCache.put(existing);
+            cacheIndexRecords(List.of(existing));
             return new CoordinatorResult<>(List.of(), result);
         }
         return appendResult(rechecked);
@@ -301,11 +316,10 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     }
 
     GlobalSequenceLookupResult lookupIndex(GlobalSequenceLookupRequest request, long indexLogHighWatermark) {
-        int maxIndexEntries = Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries());
-        return lookupCached(request, maxIndexEntries).orElseGet(() -> {
-            GlobalSequenceLookupResult result = stateRegistry.lookup(request, indexLogHighWatermark);
-            return cacheAndRecordLookup(result, request);
-        });
+        GlobalSequenceIndexLookupPreparation preparation = prepareLookup(request, indexLogHighWatermark, 0);
+        return preparation.cachedResult().orElseThrow(() ->
+            GlobalSequenceStateRegistry.outOfRange(request, request.globalStartOffset())
+        );
     }
 
     GlobalSequenceIndexLookupPreparation prepareLookup(
@@ -313,20 +327,11 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         long indexLogHighWatermark,
         int coordinatorLeaderEpoch
     ) {
+        promoteCommittedAllocations(indexLogHighWatermark);
         int maxIndexEntries = Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries());
         Optional<GlobalSequenceLookupResult> cachedResult = lookupCached(request, maxIndexEntries);
         if (cachedResult.isPresent()) {
             return GlobalSequenceIndexLookupPreparation.cached(cachedResult.get());
-        }
-
-        Optional<GlobalSequenceLookupResult> retainedResult = stateRegistry.lookupRetained(
-            request,
-            indexLogHighWatermark
-        );
-        if (retainedResult.isPresent()) {
-            return GlobalSequenceIndexLookupPreparation.cached(
-                cacheAndRecordLookup(retainedResult.get(), request)
-            );
         }
 
         long startIndexLogOffset = stateRegistry.scanStartIndexLogOffset(request, indexLogHighWatermark);
@@ -374,14 +379,34 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         GlobalSequenceLookupResult result,
         GlobalSequenceLookupRequest request
     ) {
+        cacheIndexRecords(result.indexRecords());
+        recordLookup(result, request);
+        return result;
+    }
+
+    private void cacheIndexRecords(List<GlobalSequenceIndexRecord> indexRecords) {
         long evictionsBefore = indexCache.evictionCount();
-        result.indexRecords().forEach(indexCache::put);
+        indexRecords.forEach(indexCache::put);
         long evictions = indexCache.evictionCount() - evictionsBefore;
         for (long index = 0; index < evictions; index++) {
             metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_EVICTIONS_SENSOR_NAME);
         }
-        recordLookup(result, request);
-        return result;
+    }
+
+    private void promoteCommittedAllocations(long indexLogHighWatermark) {
+        List<GlobalSequenceIndexRecord> committed = stateRegistry.promoteCommittedAllocations(
+            indexLogHighWatermark
+        );
+        if (!committed.isEmpty()) {
+            cacheIndexRecords(committed);
+            addRetainedAllocations(-committed.size());
+        }
+    }
+
+    private void addRetainedAllocations(long delta) {
+        if (metricsShard instanceof GlobalSequenceCoordinatorMetricsShard globalSequenceMetricsShard) {
+            globalSequenceMetricsShard.addRetainedAllocations(delta);
+        }
     }
 
     private void recordLookup(GlobalSequenceLookupResult result, GlobalSequenceLookupRequest request) {
@@ -410,6 +435,11 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
 
     @Override
     public void onLoaded(MetadataImage newImage) {
+        int cleared = stateRegistry.clearUncommittedAllocations();
+        if (cleared > 0) {
+            addRetainedAllocations(-cleared);
+        }
+        loading = false;
         coordinatorMetrics.activateMetricsShard(metricsShard);
     }
 
@@ -437,7 +467,9 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
 
         ApiMessageAndVersion value = record.value();
         if (value == null) {
-            stateRegistry.replayTombstone(indexKey.topicId(), indexKey.globalOffset());
+            if (stateRegistry.replayTombstone(indexKey.topicId(), indexKey.globalOffset())) {
+                addRetainedAllocations(-1L);
+            }
             indexCache.remove(indexKey.topicId(), indexKey.globalOffset());
             return;
         }
@@ -445,20 +477,19 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
             throw new IllegalStateException("Unexpected global sequence index record value " + value);
         }
 
-        long retainedAllocationsBefore = stateRegistry.retainedAllocationCount(SnapshotRegistry.LATEST_EPOCH);
-        boolean added = stateRegistry.replay(new GlobalSequenceIndexRecord(
+        GlobalSequenceIndexRecord indexRecord = new GlobalSequenceIndexRecord(
             indexKey.topicId(),
             indexKey.globalOffset(),
             indexValue.recordsCount(),
             indexValue.partitionIndex(),
             indexValue.partitionOffset()
-        ), offset);
+        );
+        boolean added = stateRegistry.replay(indexRecord, offset, !loading);
         if (added) {
-            if (metricsShard instanceof GlobalSequenceCoordinatorMetricsShard globalSequenceMetricsShard) {
-                globalSequenceMetricsShard.addRetainedAllocations(
-                    stateRegistry.retainedAllocationCount(SnapshotRegistry.LATEST_EPOCH) -
-                        retainedAllocationsBefore
-                );
+            if (loading) {
+                cacheIndexRecords(List.of(indexRecord));
+            } else {
+                addRetainedAllocations(1L);
             }
             metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_ALLOCATIONS_SENSOR_NAME);
         }

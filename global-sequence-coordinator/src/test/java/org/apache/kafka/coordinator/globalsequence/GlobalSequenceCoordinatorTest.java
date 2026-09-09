@@ -94,7 +94,7 @@ class GlobalSequenceCoordinatorTest {
             eq(expectedTopicPartition),
             any()
         )).thenReturn(CompletableFuture.completedFuture(GlobalSequenceAppendPreparation.fresh()));
-        when(runtime.<GlobalSequenceAppendResult>scheduleWriteOperation(
+        when(runtime.<GlobalSequenceAppendResult>scheduleWriteOperationWithEpoch(
             eq("append-global-sequence-index"),
             eq(expectedTopicPartition),
             eq(Duration.ofMillis(COMMIT_TIMEOUT_MS)),
@@ -105,12 +105,12 @@ class GlobalSequenceCoordinatorTest {
 
         assertEquals(expectedResponse, coordinator.appendIndex(request).join());
 
-        ArgumentCaptor<CoordinatorRuntime.CoordinatorWriteOperation<
+        ArgumentCaptor<CoordinatorRuntime.CoordinatorWriteOperationWithEpoch<
             GlobalSequenceCoordinatorShard,
             GlobalSequenceAppendResult,
             CoordinatorRecord
             >> operationCaptor = writeOperationCaptor();
-        verify(runtime).scheduleWriteOperation(
+        verify(runtime).scheduleWriteOperationWithEpoch(
             eq("append-global-sequence-index"),
             eq(expectedTopicPartition),
             eq(Duration.ofMillis(COMMIT_TIMEOUT_MS)),
@@ -120,9 +120,9 @@ class GlobalSequenceCoordinatorTest {
         GlobalSequenceCoordinatorShard shard = mock(GlobalSequenceCoordinatorShard.class);
         CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> expectedResult =
             new CoordinatorResult<>(List.of(), expectedResponse);
-        when(shard.appendIndex(request)).thenReturn(expectedResult);
+        when(shard.appendIndex(request, 10L)).thenReturn(expectedResult);
 
-        assertSame(expectedResult, operationCaptor.getValue().generateRecordsAndResult(shard));
+        assertSame(expectedResult, operationCaptor.getValue().generateRecordsAndResult(shard, 10L, 7));
     }
 
     @Test
@@ -422,12 +422,12 @@ class GlobalSequenceCoordinatorTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static ArgumentCaptor<CoordinatorRuntime.CoordinatorWriteOperation<
+    private static ArgumentCaptor<CoordinatorRuntime.CoordinatorWriteOperationWithEpoch<
         GlobalSequenceCoordinatorShard,
         GlobalSequenceAppendResult,
         CoordinatorRecord
         >> writeOperationCaptor() {
-        return ArgumentCaptor.forClass(CoordinatorRuntime.CoordinatorWriteOperation.class);
+        return ArgumentCaptor.forClass(CoordinatorRuntime.CoordinatorWriteOperationWithEpoch.class);
     }
 
     @SuppressWarnings("unchecked")
