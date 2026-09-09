@@ -466,6 +466,7 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
             .setTopicId(request.topicId())
             .setGlobalStartOffset(request.globalStartOffset())
             .setGlobalEndOffsetExclusive(request.globalEndOffsetExclusive())
+            .setMaxIndexEntries(request.maxIndexEntries())
             .setInternalRequest(true);
 
         return new RequestAndCompletionHandler(

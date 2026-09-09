@@ -2567,6 +2567,7 @@ class KafkaApisTest extends Logging {
       .setTopicId(topicId)
       .setGlobalStartOffset(2L)
       .setGlobalEndOffsetExclusive(6L)
+      .setMaxIndexEntries(17)
     val request = buildRequest(new LookupGlobalSequenceIndexRequest.Builder(wireData).build())
     val lookupFuture = new CompletableFuture[GlobalSequenceLookupResult]()
     when(globalSequenceIndexRoutingManager.lookup(any[GlobalSequenceLookupRequest]()))
@@ -2577,7 +2578,7 @@ class KafkaApisTest extends Logging {
 
     val lookupRequest = ArgumentCaptor.forClass(classOf[GlobalSequenceLookupRequest])
     verify(globalSequenceIndexRoutingManager).lookup(lookupRequest.capture())
-    assertEquals(new GlobalSequenceLookupRequest(topicId, 2L, 6L), lookupRequest.getValue)
+    assertEquals(new GlobalSequenceLookupRequest(topicId, 2L, 6L, 17), lookupRequest.getValue)
 
     lookupFuture.complete(new GlobalSequenceLookupResult(util.List.of(
       new GlobalSequenceIndexRecord(topicId, 0L, 4, 1, 10L),
@@ -2591,6 +2592,8 @@ class KafkaApisTest extends Logging {
     assertEquals(1, response.data.indexEntries.get(0).physicalPartition)
     assertEquals(10L, response.data.indexEntries.get(0).physicalBaseOffset)
     assertEquals(4L, response.data.indexEntries.get(1).globalBaseOffset)
+    assertEquals(6L, response.data.nextGlobalOffset)
+    assertFalse(response.data.hasMore)
   }
 
   @Test
@@ -2706,6 +2709,7 @@ class KafkaApisTest extends Logging {
       .setGlobalStartOffset(2L)
       .setGlobalEndOffsetExclusive(6L)
       .setMaxBytes(1024)
+      .setMaxIndexEntries(17)
       .setIsolationLevel(IsolationLevel.READ_COMMITTED.id)
     val request = buildRequest(new FetchGlobalSequenceRequest.Builder(wireData).build())
     val fetchFuture = new CompletableFuture[GlobalSequenceFetchResult]()
@@ -2718,7 +2722,7 @@ class KafkaApisTest extends Logging {
     val fetchRequest = ArgumentCaptor.forClass(classOf[GlobalSequenceFetchRequest])
     verify(globalSequenceIndexRoutingManager).fetch(fetchRequest.capture())
     assertEquals(
-      new GlobalSequenceFetchRequest(topicId, 2L, 6L, 1024, IsolationLevel.READ_COMMITTED),
+      new GlobalSequenceFetchRequest(topicId, 2L, 6L, 1024, 17, IsolationLevel.READ_COMMITTED),
       fetchRequest.getValue
     )
 

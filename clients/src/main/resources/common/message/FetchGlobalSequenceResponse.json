@@ -17,7 +17,7 @@
   "apiKey": 259,
   "type": "response",
   "name": "FetchGlobalSequenceResponse",
-  "validVersions": "0",
+  "validVersions": "0-1",
   "flexibleVersions": "0+",
   // - UNKNOWN_TOPIC_ID (version 0+)
   // - TOPIC_AUTHORIZATION_FAILED (version 0+)

@@ -42,6 +42,7 @@ import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceAppendRequest;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceAppendResult;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinator;
+import org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinatorConfig;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceFetchRequest;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceFetchResult;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceIndexRecord;
@@ -224,6 +225,8 @@ class GlobalSequenceIndexRoutingManagerTest {
         assertEquals(TOPIC_ID, wireRequest.data().topicId());
         assertEquals(2L, wireRequest.data().globalStartOffset());
         assertEquals(6L, wireRequest.data().globalEndOffsetExclusive());
+        assertEquals(GlobalSequenceCoordinatorConfig.MAX_LOOKUP_INDEX_ENTRIES_DEFAULT,
+            wireRequest.data().maxIndexEntries());
         assertTrue(wireRequest.data().internalRequest());
         verify(coordinator, never()).lookupIndex(LOOKUP_REQUEST);
 

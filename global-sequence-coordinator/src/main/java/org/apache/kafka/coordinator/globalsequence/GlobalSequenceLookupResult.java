@@ -20,7 +20,7 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * The committed physical batch mappings which completely cover a requested global range.
+ * A contiguous page of committed physical batch mappings for a requested global range.
  */
 public record GlobalSequenceLookupResult(List<GlobalSequenceIndexRecord> indexRecords) {
     public GlobalSequenceLookupResult {

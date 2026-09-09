@@ -26,12 +26,27 @@ import java.util.Objects;
  * @param topicId the controller-assigned ID of the data topic
  * @param globalStartOffset the first global offset to resolve, inclusive
  * @param globalEndOffsetExclusive the end of the global range, exclusive
+ * @param maxIndexEntries the maximum number of physical batch mappings to return
  */
 public record GlobalSequenceLookupRequest(
     Uuid topicId,
     long globalStartOffset,
-    long globalEndOffsetExclusive
+    long globalEndOffsetExclusive,
+    int maxIndexEntries
 ) {
+    public GlobalSequenceLookupRequest(
+        Uuid topicId,
+        long globalStartOffset,
+        long globalEndOffsetExclusive
+    ) {
+        this(
+            topicId,
+            globalStartOffset,
+            globalEndOffsetExclusive,
+            GlobalSequenceCoordinatorConfig.MAX_LOOKUP_INDEX_ENTRIES_DEFAULT
+        );
+    }
+
     public GlobalSequenceLookupRequest {
         Objects.requireNonNull(topicId, "topicId");
         if (Uuid.ZERO_UUID.equals(topicId)) {
@@ -44,6 +59,9 @@ public record GlobalSequenceLookupRequest(
             throw new IllegalArgumentException(
                 "globalEndOffsetExclusive must be greater than globalStartOffset"
             );
+        }
+        if (maxIndexEntries <= 0) {
+            throw new IllegalArgumentException("maxIndexEntries must be positive");
         }
     }
 }

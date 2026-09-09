@@ -17,7 +17,7 @@
   "apiKey": 258,
   "type": "response",
   "name": "LookupGlobalSequenceIndexResponse",
-  "validVersions": "0",
+  "validVersions": "0-1",
   "flexibleVersions": "0+",
   // - NOT_COORDINATOR (version 0+)
   // - COORDINATOR_NOT_AVAILABLE (version 0+)
@@ -35,8 +35,12 @@
       "about": "The error code, or 0 if there was no error." },
     { "name": "ErrorMessage", "type": "string", "versions": "0+", "nullableVersions": "0+", "default": "null",
       "about": "The error message, or null if there was no error." },
+    { "name": "NextGlobalOffset", "type": "int64", "versions": "1+", "default": "-1",
+      "about": "The global offset from which the next lookup page should start." },
+    { "name": "HasMore", "type": "bool", "versions": "1+", "default": "false",
+      "about": "True when more index entries remain in the requested range." },
     { "name": "IndexEntries", "type": "[]GlobalSequenceIndexEntry", "versions": "0+",
-      "about": "The physical batches which completely cover the requested global range.", "fields": [
+      "about": "A contiguous page of physical batches covering the requested global range.", "fields": [
       { "name": "GlobalBaseOffset", "type": "int64", "versions": "0+",
         "about": "The first global offset mapped by this physical batch." },
       { "name": "RecordCount", "type": "int32", "versions": "0+",

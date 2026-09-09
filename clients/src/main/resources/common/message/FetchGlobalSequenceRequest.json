@@ -18,7 +18,7 @@
   "type": "request",
   "listeners": ["broker"],
   "name": "FetchGlobalSequenceRequest",
-  "validVersions": "0",
+  "validVersions": "0-1",
   "flexibleVersions": "0+",
   "fields": [
     { "name": "TopicId", "type": "uuid", "versions": "0+",
@@ -29,6 +29,8 @@
       "about": "The end of the global offset range to fetch, exclusive." },
     { "name": "MaxBytes", "type": "int32", "versions": "0+", "default": "1048576",
       "about": "The maximum record bytes to return. The first complete batch may exceed this limit." },
+    { "name": "MaxIndexEntries", "type": "int32", "versions": "1+", "default": "1024",
+      "about": "The maximum number of index entries to resolve for this response page." },
     { "name": "IsolationLevel", "type": "int8", "versions": "0+", "default": "0",
       "about": "0 for read-uncommitted and 1 for read-committed." }
   ]

@@ -64,6 +64,14 @@ class GlobalSequenceFetchRequestTest {
             1024,
             null
         ));
+        assertThrows(IllegalArgumentException.class, () -> new GlobalSequenceFetchRequest(
+            topicId,
+            0L,
+            1L,
+            1024,
+            0,
+            IsolationLevel.READ_UNCOMMITTED
+        ));
     }
 
     @Test

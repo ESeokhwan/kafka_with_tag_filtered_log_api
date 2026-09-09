@@ -18,7 +18,7 @@
   "type": "request",
   "listeners": ["broker"],
   "name": "LookupGlobalSequenceIndexRequest",
-  "validVersions": "0",
+  "validVersions": "0-1",
   "flexibleVersions": "0+",
   "fields": [
     { "name": "TopicId", "type": "uuid", "versions": "0+",
@@ -27,6 +27,8 @@
       "about": "The first global offset to resolve, inclusive." },
     { "name": "GlobalEndOffsetExclusive", "type": "int64", "versions": "0+",
       "about": "The end of the global offset range to resolve, exclusive." },
+    { "name": "MaxIndexEntries", "type": "int32", "versions": "1+", "default": "1024",
+      "about": "The maximum number of physical batch mappings to return." },
     { "name": "InternalRequest", "type": "bool", "versions": "0+", "default": "false",
       "about": "True when another broker routed this request to the index leader." }
   ]

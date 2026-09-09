@@ -47,5 +47,9 @@ class GlobalSequenceLookupRequestTest {
             IllegalArgumentException.class,
             () -> new GlobalSequenceLookupRequest(topicId, 2L, 1L)
         );
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> new GlobalSequenceLookupRequest(topicId, 0L, 1L, 0)
+        );
     }
 }

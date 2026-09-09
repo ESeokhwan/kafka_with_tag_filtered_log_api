@@ -23,14 +23,34 @@ import java.util.Objects;
 
 /**
  * Describes a global offset range whose physical records should be fetched.
+ * The result can end before the requested range due to either {@code maxBytes} or
+ * {@code maxIndexEntries}; callers continue from the returned next global offset.
  */
 public record GlobalSequenceFetchRequest(
     Uuid topicId,
     long globalStartOffset,
     long globalEndOffsetExclusive,
     int maxBytes,
+    int maxIndexEntries,
     IsolationLevel isolationLevel
 ) {
+    public GlobalSequenceFetchRequest(
+        Uuid topicId,
+        long globalStartOffset,
+        long globalEndOffsetExclusive,
+        int maxBytes,
+        IsolationLevel isolationLevel
+    ) {
+        this(
+            topicId,
+            globalStartOffset,
+            globalEndOffsetExclusive,
+            maxBytes,
+            GlobalSequenceCoordinatorConfig.MAX_LOOKUP_INDEX_ENTRIES_DEFAULT,
+            isolationLevel
+        );
+    }
+
     public GlobalSequenceFetchRequest {
         Objects.requireNonNull(topicId, "topicId");
         Objects.requireNonNull(isolationLevel, "isolationLevel");
@@ -47,6 +67,9 @@ public record GlobalSequenceFetchRequest(
         }
         if (maxBytes <= 0) {
             throw new IllegalArgumentException("maxBytes must be positive");
+        }
+        if (maxIndexEntries <= 0) {
+            throw new IllegalArgumentException("maxIndexEntries must be positive");
         }
     }
 }

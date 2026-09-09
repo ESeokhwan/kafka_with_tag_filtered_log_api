@@ -3719,7 +3719,8 @@ class KafkaApis(val requestChannel: RequestChannel,
       globalSequenceIndexRoutingManager.lookup(new GlobalSequenceLookupRequest(
         data.topicId,
         data.globalStartOffset,
-        data.globalEndOffsetExclusive
+        data.globalEndOffsetExclusive,
+        data.maxIndexEntries
       ))
     } catch {
       case exception: IllegalArgumentException =>
@@ -3733,16 +3734,31 @@ class KafkaApis(val requestChannel: RequestChannel,
       if (exception != null) {
         requestHelper.sendMaybeThrottle(request, lookupRequest.getErrorResponse(0, exception))
       } else {
-        val entries = result.indexRecords.asScala.map { indexRecord =>
-          new LookupGlobalSequenceIndexResponseData.GlobalSequenceIndexEntry()
-            .setGlobalBaseOffset(indexRecord.globalBaseOffset)
-            .setRecordCount(indexRecord.recordCount)
-            .setPhysicalPartition(indexRecord.partitionIndex)
-            .setPhysicalBaseOffset(indexRecord.partitionBaseOffset)
-        }.asJava
-        requestHelper.sendMaybeThrottle(request, new LookupGlobalSequenceIndexResponse(
-          new LookupGlobalSequenceIndexResponseData().setIndexEntries(entries)
-        ))
+        val nextGlobalOffset = Math.min(
+          result.indexRecords.get(result.indexRecords.size - 1).globalEndOffsetExclusive,
+          data.globalEndOffsetExclusive
+        )
+        val hasMore = nextGlobalOffset < data.globalEndOffsetExclusive
+        if (lookupRequest.version < 1 && hasMore) {
+          requestHelper.sendMaybeThrottle(request, lookupRequest.getErrorResponse(
+            0,
+            new InvalidRequestException("Lookup result exceeds the version 0 response limit; use version 1 pagination")
+          ))
+        } else {
+          val entries = result.indexRecords.asScala.map { indexRecord =>
+            new LookupGlobalSequenceIndexResponseData.GlobalSequenceIndexEntry()
+              .setGlobalBaseOffset(indexRecord.globalBaseOffset)
+              .setRecordCount(indexRecord.recordCount)
+              .setPhysicalPartition(indexRecord.partitionIndex)
+              .setPhysicalBaseOffset(indexRecord.partitionBaseOffset)
+          }.asJava
+          requestHelper.sendMaybeThrottle(request, new LookupGlobalSequenceIndexResponse(
+            new LookupGlobalSequenceIndexResponseData()
+              .setNextGlobalOffset(nextGlobalOffset)
+              .setHasMore(hasMore)
+              .setIndexEntries(entries)
+          ))
+        }
       }
     }
   }
@@ -3772,6 +3788,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         data.globalStartOffset,
         data.globalEndOffsetExclusive,
         data.maxBytes,
+        data.maxIndexEntries,
         IsolationLevel.forId(data.isolationLevel)
       ))
     } catch {
