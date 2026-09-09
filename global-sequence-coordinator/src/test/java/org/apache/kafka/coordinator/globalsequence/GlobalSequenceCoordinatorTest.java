@@ -36,6 +36,7 @@ import org.mockito.ArgumentCaptor;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 
@@ -88,6 +89,11 @@ class GlobalSequenceCoordinatorTest {
             Utils.abs(request.topicId().hashCode()) % NUM_PARTITIONS
         );
 
+        when(runtime.<GlobalSequenceAppendPreparation>scheduleReadOperationWithEpoch(
+            eq("prepare-global-sequence-index-append"),
+            eq(expectedTopicPartition),
+            any()
+        )).thenReturn(CompletableFuture.completedFuture(GlobalSequenceAppendPreparation.fresh()));
         when(runtime.<GlobalSequenceAppendResult>scheduleWriteOperation(
             eq("append-global-sequence-index"),
             eq(expectedTopicPartition),
@@ -97,7 +103,7 @@ class GlobalSequenceCoordinatorTest {
 
         coordinator.startup(() -> NUM_PARTITIONS);
 
-        assertSame(expectedFuture, coordinator.appendIndex(request));
+        assertEquals(expectedResponse, coordinator.appendIndex(request).join());
 
         ArgumentCaptor<CoordinatorRuntime.CoordinatorWriteOperation<
             GlobalSequenceCoordinatorShard,
@@ -144,6 +150,91 @@ class GlobalSequenceCoordinatorTest {
             new TopicPartition(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME, 4),
             OptionalInt.empty()
         );
+    }
+
+    @Test
+    void testOldPhysicalBatchRetryScansMixedIndexLogAndRechecksInWriteOperation() {
+        GlobalSequenceAppendRequest request = new GlobalSequenceAppendRequest(
+            Uuid.randomUuid(),
+            3,
+            42L,
+            4
+        );
+        TopicPartition topicPartition = new TopicPartition(
+            Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME,
+            Utils.abs(request.topicId().hashCode()) % NUM_PARTITIONS
+        );
+        GlobalSequencePhysicalIndexScanPlan plan = new GlobalSequencePhysicalIndexScanPlan(
+            request.topicId(),
+            request.partitionIndex(),
+            request.partitionBaseOffset(),
+            request.recordCount(),
+            4L,
+            10L,
+            7
+        );
+        GlobalSequenceIndexRecord existing = new GlobalSequenceIndexRecord(
+            request.topicId(),
+            8L,
+            request.recordCount(),
+            request.partitionIndex(),
+            request.partitionBaseOffset()
+        );
+        GlobalSequenceAppendResult expected = existing.toAppendResult(true);
+        GlobalSequenceCoordinatorShard shard = mock(GlobalSequenceCoordinatorShard.class);
+
+        when(runtime.<GlobalSequenceAppendPreparation>scheduleReadOperationWithEpoch(
+            eq("prepare-global-sequence-index-append"),
+            eq(topicPartition),
+            any()
+        )).thenReturn(CompletableFuture.completedFuture(GlobalSequenceAppendPreparation.scan(plan)));
+        when(indexLogReader.read(
+            eq(topicPartition),
+            eq(4L),
+            eq(10L),
+            eq(GlobalSequenceCoordinatorConfig.INDEX_LOG_READ_MAX_BYTES_DEFAULT)
+        )).thenReturn(CompletableFuture.completedFuture(new GlobalSequenceIndexLogReadResult(
+            List.of(
+                GlobalSequenceIndexLogEntry.allocation(4L, new GlobalSequenceIndexRecord(
+                    Uuid.randomUuid(), 0L, 1, request.partitionIndex(), request.partitionBaseOffset()
+                )),
+                GlobalSequenceIndexLogEntry.allocation(5L, new GlobalSequenceIndexRecord(
+                    request.topicId(), 4L, 2, request.partitionIndex() + 1, request.partitionBaseOffset()
+                )),
+                GlobalSequenceIndexLogEntry.allocation(6L, existing)
+            ),
+            10L,
+            true,
+            256
+        )));
+        CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> writeResult =
+            new CoordinatorResult<>(List.of(), expected);
+        when(shard.appendIndexAfterScan(plan, Optional.of(existing), 10L, 7)).thenReturn(writeResult);
+        when(runtime.<GlobalSequenceAppendResult>scheduleWriteOperationWithEpoch(
+            eq("append-global-sequence-index-after-physical-scan"),
+            eq(topicPartition),
+            eq(Duration.ofMillis(COMMIT_TIMEOUT_MS)),
+            any()
+        )).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            CoordinatorRuntime.CoordinatorWriteOperationWithEpoch<
+                GlobalSequenceCoordinatorShard,
+                GlobalSequenceAppendResult,
+                CoordinatorRecord
+                > operation = invocation.getArgument(3);
+            return CompletableFuture.completedFuture(operation.generateRecordsAndResult(shard, 10L, 7).response());
+        });
+
+        coordinator.startup(() -> NUM_PARTITIONS);
+
+        assertEquals(expected, coordinator.appendIndex(request).join());
+        verify(indexLogReader).read(
+            topicPartition,
+            4L,
+            10L,
+            GlobalSequenceCoordinatorConfig.INDEX_LOG_READ_MAX_BYTES_DEFAULT
+        );
+        verify(shard).appendIndexAfterScan(plan, Optional.of(existing), 10L, 7);
     }
 
     @Test

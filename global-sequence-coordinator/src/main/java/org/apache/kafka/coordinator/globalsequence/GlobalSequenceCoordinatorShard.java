@@ -187,6 +187,106 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     ) {
         GlobalSequenceStateRegistry.PreparedAppend preparedAppend = stateRegistry.prepareAppend(request);
 
+        return appendResult(preparedAppend);
+    }
+
+    GlobalSequenceAppendPreparation prepareAppend(
+        GlobalSequenceAppendRequest request,
+        long indexLogHighWatermark,
+        int coordinatorLeaderEpoch
+    ) {
+        if (stateRegistry.isNewPhysicalBatch(request, indexLogHighWatermark)) {
+            return GlobalSequenceAppendPreparation.fresh();
+        }
+
+        Optional<GlobalSequenceIndexRecord> cached = indexCache.getByPhysicalBatch(request.physicalBatchId());
+        if (cached.isPresent()) {
+            metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_HITS_SENSOR_NAME);
+            return GlobalSequenceAppendPreparation.duplicate(toDuplicateResult(cached.get(), request));
+        }
+        metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_MISSES_SENSOR_NAME);
+
+        long startIndexLogOffset = stateRegistry.physicalScanStartIndexLogOffset(
+            request,
+            indexLogHighWatermark
+        );
+        return GlobalSequenceAppendPreparation.scan(new GlobalSequencePhysicalIndexScanPlan(
+            request.topicId(),
+            request.partitionIndex(),
+            request.partitionBaseOffset(),
+            request.recordCount(),
+            startIndexLogOffset,
+            indexLogHighWatermark,
+            coordinatorLeaderEpoch
+        ));
+    }
+
+    CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> appendIndexAfterScan(
+        GlobalSequencePhysicalIndexScanPlan plan,
+        Optional<GlobalSequenceIndexRecord> scannedIndexRecord,
+        long currentIndexLogHighWatermark,
+        int currentCoordinatorLeaderEpoch
+    ) {
+        if (currentCoordinatorLeaderEpoch != plan.coordinatorLeaderEpoch() ||
+            currentIndexLogHighWatermark < plan.capturedHighWatermark()) {
+            throw Errors.NOT_COORDINATOR.exception(
+                "Discarding a physical batch index scan captured at coordinator leader epoch " +
+                    plan.coordinatorLeaderEpoch() + " because the current epoch is " +
+                    currentCoordinatorLeaderEpoch
+            );
+        }
+
+        GlobalSequenceAppendRequest request = plan.request();
+        GlobalSequenceStateRegistry.PreparedAppend rechecked = stateRegistry.prepareAppend(request);
+        if (rechecked.duplicate()) {
+            return appendResult(rechecked);
+        }
+
+        Optional<GlobalSequenceIndexRecord> cached = indexCache.getByPhysicalBatch(request.physicalBatchId());
+        if (cached.isPresent()) {
+            metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_HITS_SENSOR_NAME);
+            return duplicateResult(cached.get(), request);
+        }
+        metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_MISSES_SENSOR_NAME);
+
+        if (scannedIndexRecord.isPresent()) {
+            GlobalSequenceIndexRecord existing = scannedIndexRecord.get();
+            GlobalSequenceAppendResult result = toDuplicateResult(existing, request);
+            indexCache.put(existing);
+            return new CoordinatorResult<>(List.of(), result);
+        }
+        return appendResult(rechecked);
+    }
+
+    private CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> duplicateResult(
+        GlobalSequenceIndexRecord existing,
+        GlobalSequenceAppendRequest request
+    ) {
+        return new CoordinatorResult<>(List.of(), toDuplicateResult(existing, request));
+    }
+
+    private GlobalSequenceAppendResult toDuplicateResult(
+        GlobalSequenceIndexRecord existing,
+        GlobalSequenceAppendRequest request
+    ) {
+        if (!existing.topicId().equals(request.topicId()) ||
+            existing.partitionIndex() != request.partitionIndex() ||
+            existing.partitionBaseOffset() != request.partitionBaseOffset()) {
+            throw new IllegalArgumentException("The existing allocation does not match physical batch " + request);
+        }
+        if (existing.recordCount() != request.recordCount()) {
+            throw new IllegalArgumentException(
+                "Physical batch " + request.physicalBatchId() + " is already allocated with recordCount=" +
+                    existing.recordCount() + ", but the retry has recordCount=" + request.recordCount()
+            );
+        }
+        return existing.toAppendResult(true);
+    }
+
+    private CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> appendResult(
+        GlobalSequenceStateRegistry.PreparedAppend preparedAppend
+    ) {
+
         if (preparedAppend.duplicate()) {
             return new CoordinatorResult<>(
                 List.of(),

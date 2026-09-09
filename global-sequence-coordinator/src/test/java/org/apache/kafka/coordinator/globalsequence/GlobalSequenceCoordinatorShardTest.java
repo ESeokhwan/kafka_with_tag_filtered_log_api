@@ -38,6 +38,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -49,13 +50,14 @@ class GlobalSequenceCoordinatorShardTest {
     private static final Uuid TOPIC_ID = Uuid.randomUuid();
 
     private GlobalSequenceStateRegistry stateRegistry;
+    private SnapshotRegistry snapshotRegistry;
     private GlobalSequenceCoordinatorShard shard;
 
     @BeforeEach
     void setUp() {
         LogContext logContext = new LogContext();
         MockTime time = new MockTime();
-        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(logContext);
+        snapshotRegistry = new SnapshotRegistry(logContext);
         stateRegistry = new GlobalSequenceStateRegistry(snapshotRegistry);
 
         GlobalSequenceCoordinatorConfig config = new GlobalSequenceCoordinatorConfig(
@@ -141,6 +143,68 @@ class GlobalSequenceCoordinatorShardTest {
                 new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 5L),
                 SnapshotRegistry.LATEST_EPOCH
             )
+        );
+    }
+
+    @Test
+    void testOldPhysicalBatchRetryBuildsScanPlanFromPhysicalCheckpoint() {
+        GlobalSequenceIndexRecord existing = new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 1, 1, 20L);
+        replay(coordinatorRecord(existing));
+        snapshotRegistry.idempotentCreateSnapshot(1L);
+        GlobalSequenceAppendRequest request = request(TOPIC_ID, 1, 20L, 1);
+
+        assertEquals(
+            GlobalSequenceAppendPreparation.scan(new GlobalSequencePhysicalIndexScanPlan(
+                TOPIC_ID,
+                1,
+                20L,
+                1,
+                0L,
+                1L,
+                7
+            )),
+            shard.prepareAppend(request, 1L, 7)
+        );
+    }
+
+    @Test
+    void testConcurrentPhysicalBatchRetryIsRecheckedAfterScan() {
+        GlobalSequencePhysicalIndexScanPlan plan = new GlobalSequencePhysicalIndexScanPlan(
+            TOPIC_ID,
+            1,
+            20L,
+            1,
+            0L,
+            1L,
+            7
+        );
+
+        CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> first =
+            shard.appendIndexAfterScan(plan, Optional.empty(), 1L, 7);
+        replay(first.records().get(0));
+        CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> concurrentRetry =
+            shard.appendIndexAfterScan(plan, Optional.empty(), 1L, 7);
+
+        assertEquals(new GlobalSequenceAppendResult(0L, 1, false), first.response());
+        assertEquals(List.of(), concurrentRetry.records());
+        assertEquals(new GlobalSequenceAppendResult(0L, 1, true), concurrentRetry.response());
+    }
+
+    @Test
+    void testPhysicalRetryScanIsDiscardedAfterCoordinatorReelection() {
+        GlobalSequencePhysicalIndexScanPlan plan = new GlobalSequencePhysicalIndexScanPlan(
+            TOPIC_ID,
+            1,
+            20L,
+            1,
+            0L,
+            1L,
+            7
+        );
+
+        assertThrows(
+            NotCoordinatorException.class,
+            () -> shard.appendIndexAfterScan(plan, Optional.empty(), 1L, 8)
         );
     }
 

@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /**
  * The replay-driven state owned by one global sequence coordinator shard.
@@ -36,6 +37,7 @@ public class GlobalSequenceStateRegistry {
     private final int maxLookupIndexEntries;
     private final int maxRetainedIndexEntries;
     private final GlobalSequenceIndexCheckpointIndex checkpointIndex;
+    private final GlobalSequencePhysicalCheckpointIndex physicalCheckpointIndex;
     private final TimelineHashMap<Long, RetainedAllocation> retainedAllocations;
     private final TimelineLong replaySequence;
 
@@ -77,6 +79,11 @@ public class GlobalSequenceStateRegistry {
         this.maxRetainedIndexEntries = maxRetainedIndexEntries;
         this.stateMap = new TimelineHashMap<>(snapshotRegistry, 0);
         this.checkpointIndex = new GlobalSequenceIndexCheckpointIndex(
+            snapshotRegistry,
+            checkpointInterval,
+            checkpointLevelFactor
+        );
+        this.physicalCheckpointIndex = new GlobalSequencePhysicalCheckpointIndex(
             snapshotRegistry,
             checkpointInterval,
             checkpointLevelFactor
@@ -133,6 +140,12 @@ public class GlobalSequenceStateRegistry {
         checkpointIndex.replayAllocation(
             indexRecord.topicId(),
             indexRecord.globalBaseOffset(),
+            indexLogOffset
+        );
+        physicalCheckpointIndex.replayAllocation(
+            indexRecord.topicId(),
+            indexRecord.partitionIndex(),
+            indexRecord.partitionBaseOffset(),
             indexLogOffset
         );
         long sequence = replaySequence.get();
@@ -205,12 +218,43 @@ public class GlobalSequenceStateRegistry {
         return checkpoint.indexLogOffset();
     }
 
+    boolean isNewPhysicalBatch(GlobalSequenceAppendRequest request, long indexLogHighWatermark) {
+        Objects.requireNonNull(request, "request");
+        GlobalSequenceState state = stateMap.get(request.topicId(), indexLogHighWatermark);
+        if (state == null) {
+            return true;
+        }
+        OptionalLong lastPhysicalBaseOffset = state.lastPhysicalBaseOffset(
+            request.partitionIndex(),
+            indexLogHighWatermark
+        );
+        return lastPhysicalBaseOffset.isEmpty() ||
+            request.partitionBaseOffset() > lastPhysicalBaseOffset.getAsLong();
+    }
+
+    long physicalScanStartIndexLogOffset(
+        GlobalSequenceAppendRequest request,
+        long indexLogHighWatermark
+    ) {
+        Objects.requireNonNull(request, "request");
+        return physicalCheckpointIndex.floor(
+            request.topicId(),
+            request.partitionIndex(),
+            request.partitionBaseOffset(),
+            indexLogHighWatermark
+        ).map(GlobalSequencePhysicalCheckpoint::indexLogOffset).orElse(0L);
+    }
+
     int retainedAllocationCount(long epoch) {
         return retainedAllocations.size(epoch);
     }
 
     int checkpointCount(Uuid topicId, long epoch) {
         return checkpointIndex.numCheckpoints(topicId, epoch);
+    }
+
+    int physicalCheckpointCount(Uuid topicId, int partitionIndex, long epoch) {
+        return physicalCheckpointIndex.numCheckpoints(topicId, partitionIndex, epoch);
     }
 
     static OffsetOutOfRangeException outOfRange(
@@ -247,6 +291,7 @@ public class GlobalSequenceStateRegistry {
         // a snapshot-aware binary-search index without rebuilding and sorting every lookup.
         private final TimelineHashMap<Long, GlobalSequenceIndexRecord> sequenceByAllocationOrdinal;
         private final TimelineHashMap<PhysicalBatchId, GlobalSequenceIndexRecord> sequenceByPhysicalBatch;
+        private final TimelineHashMap<Integer, Long> lastPhysicalBaseOffsetByPartition;
         private final GlobalOffsetSequencer offsetSequencer;
         private final TimelineLong allocationCount;
         private final TimelineLong firstRetainedAllocationOrdinal;
@@ -255,6 +300,7 @@ public class GlobalSequenceStateRegistry {
             this.sequenceByGlobalBaseOffset = new TimelineHashMap<>(snapshotRegistry, 0);
             this.sequenceByAllocationOrdinal = new TimelineHashMap<>(snapshotRegistry, 0);
             this.sequenceByPhysicalBatch = new TimelineHashMap<>(snapshotRegistry, 0);
+            this.lastPhysicalBaseOffsetByPartition = new TimelineHashMap<>(snapshotRegistry, 0);
             this.offsetSequencer = new BasicGlobalOffsetSequencer(snapshotRegistry);
             this.allocationCount = new TimelineLong(snapshotRegistry);
             this.firstRetainedAllocationOrdinal = new TimelineLong(snapshotRegistry);
@@ -329,9 +375,21 @@ public class GlobalSequenceStateRegistry {
             sequenceByGlobalBaseOffset.put(indexRecord.globalBaseOffset(), indexRecord);
             sequenceByPhysicalBatch.put(physicalBatchId, indexRecord);
             sequenceByAllocationOrdinal.put(allocationOrdinal, indexRecord);
+            Long lastPhysicalBaseOffset = lastPhysicalBaseOffsetByPartition.get(indexRecord.partitionIndex());
+            if (lastPhysicalBaseOffset == null || indexRecord.partitionBaseOffset() > lastPhysicalBaseOffset) {
+                lastPhysicalBaseOffsetByPartition.put(
+                    indexRecord.partitionIndex(),
+                    indexRecord.partitionBaseOffset()
+                );
+            }
             offsetSequencer.replayAllocation(indexRecord.globalBaseOffset(), indexRecord.recordCount());
             allocationCount.set(nextAllocationCount);
             return new ReplayResult(true, allocationOrdinal);
+        }
+
+        OptionalLong lastPhysicalBaseOffset(int partitionIndex, long epoch) {
+            Long offset = lastPhysicalBaseOffsetByPartition.get(partitionIndex, epoch);
+            return offset == null ? OptionalLong.empty() : OptionalLong.of(offset);
         }
 
         void evict(long allocationOrdinal, GlobalSequenceIndexRecord indexRecord) {

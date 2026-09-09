@@ -514,6 +514,33 @@ class GlobalSequenceStateRegistryTest {
     }
 
     @Test
+    void testTracksLatestPhysicalOffsetsAndCheckpointsPerPartition() {
+        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+        GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(
+            snapshotRegistry,
+            10,
+            2,
+            1,
+            2
+        );
+        registry.replay(record(TOPIC_ID, 0L, 1, 0, 10L), 100L);
+        registry.replay(record(TOPIC_ID, 1L, 1, 1, 50L), 101L);
+        registry.replay(record(TOPIC_ID, 2L, 1, 0, 11L), 102L);
+        snapshotRegistry.idempotentCreateSnapshot(103L);
+
+        assertTrue(registry.isNewPhysicalBatch(request(TOPIC_ID, 0, 12L, 1), 103L));
+        assertFalse(registry.isNewPhysicalBatch(request(TOPIC_ID, 0, 10L, 1), 103L));
+        assertFalse(registry.isNewPhysicalBatch(request(TOPIC_ID, 1, 49L, 1), 103L));
+        assertTrue(registry.isNewPhysicalBatch(request(OTHER_TOPIC_ID, 0, 0L, 1), 103L));
+        assertEquals(
+            100L,
+            registry.physicalScanStartIndexLogOffset(request(TOPIC_ID, 0, 10L, 1), 103L)
+        );
+        assertEquals(2, registry.physicalCheckpointCount(TOPIC_ID, 0, 103L));
+        assertEquals(1, registry.physicalCheckpointCount(TOPIC_ID, 1, 103L));
+    }
+
+    @Test
     void testSnapshotRollbackRestoresBoundedRecentWindowAndCheckpoints() {
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
         GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(

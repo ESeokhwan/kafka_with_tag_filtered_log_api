@@ -245,12 +245,100 @@ public class GlobalSequenceCoordinator {
             GlobalSequenceAppendRequest request
     ) {
         throwIfNotActive();
+        TopicPartition topicPartition = topicPartitionFor(request.topicId());
+        return runtime.<GlobalSequenceAppendPreparation>scheduleReadOperationWithEpoch(
+            "prepare-global-sequence-index-append",
+            topicPartition,
+            (coordinator, indexLogHighWatermark, coordinatorLeaderEpoch) ->
+                coordinator.prepareAppend(request, indexLogHighWatermark, coordinatorLeaderEpoch)
+        ).thenCompose(preparation -> {
+            if (preparation.duplicateResult().isPresent()) {
+                return CompletableFuture.completedFuture(preparation.duplicateResult().get());
+            }
+            if (preparation.scanPlan().isEmpty()) {
+                return scheduleAppend(topicPartition, request);
+            }
+
+            GlobalSequencePhysicalIndexScanPlan plan = preparation.scanPlan().get();
+            return scanPhysicalIndex(topicPartition, plan).thenCompose(scannedIndexRecord ->
+                runtime.scheduleWriteOperationWithEpoch(
+                    "append-global-sequence-index-after-physical-scan",
+                    topicPartition,
+                    Duration.ofMillis(config.commitTimeoutMs()),
+                    (coordinator, currentHighWatermark, currentCoordinatorLeaderEpoch) ->
+                        coordinator.appendIndexAfterScan(
+                            plan,
+                            scannedIndexRecord,
+                            currentHighWatermark,
+                            currentCoordinatorLeaderEpoch
+                        )
+                )
+            );
+        });
+    }
+
+    private CompletableFuture<GlobalSequenceAppendResult> scheduleAppend(
+        TopicPartition topicPartition,
+        GlobalSequenceAppendRequest request
+    ) {
         return runtime.scheduleWriteOperation(
             "append-global-sequence-index",
-            topicPartitionFor(request.topicId()),
+            topicPartition,
             Duration.ofMillis(config.commitTimeoutMs()),
             coordinator -> coordinator.appendIndex(request)
         );
+    }
+
+    private CompletableFuture<Optional<GlobalSequenceIndexRecord>> scanPhysicalIndex(
+        TopicPartition topicPartition,
+        GlobalSequencePhysicalIndexScanPlan plan
+    ) {
+        return scanPhysicalIndexChunk(
+            topicPartition,
+            plan,
+            plan.startIndexLogOffset(),
+            new PhysicalScanAccumulator(plan)
+        );
+    }
+
+    private CompletableFuture<Optional<GlobalSequenceIndexRecord>> scanPhysicalIndexChunk(
+        TopicPartition topicPartition,
+        GlobalSequencePhysicalIndexScanPlan plan,
+        long nextLogOffset,
+        PhysicalScanAccumulator accumulator
+    ) {
+        long remainingScanBytes = config.indexLookupMaxScanBytes() - accumulator.bytesRead();
+        int readMaxBytes = (int) Math.min(config.indexLogReadMaxBytes(), remainingScanBytes);
+        return indexLogReader.read(
+            topicPartition,
+            nextLogOffset,
+            plan.capturedHighWatermark(),
+            readMaxBytes
+        ).thenCompose(readResult -> {
+            coordinatorMetrics.record(GlobalSequenceCoordinatorMetrics.INDEX_LOG_READS_SENSOR_NAME);
+            coordinatorMetrics.record(
+                GlobalSequenceCoordinatorMetrics.INDEX_LOG_READ_BYTES_SENSOR_NAME,
+                readResult.bytesRead()
+            );
+            accumulator.addBytes(readResult.bytesRead());
+            accumulator.add(readResult.entries());
+
+            if (readResult.reachedEndOffset()) {
+                return CompletableFuture.completedFuture(accumulator.result());
+            }
+            if (accumulator.bytesRead() >= config.indexLookupMaxScanBytes()) {
+                return CompletableFuture.failedFuture(new InvalidRequestException(
+                    "Physical batch index lookup exceeded the configured scan limit of " +
+                        config.indexLookupMaxScanBytes() + " bytes."
+                ));
+            }
+            if (readResult.nextLogOffset() <= nextLogOffset) {
+                return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Global sequence index log reader did not make progress from offset " + nextLogOffset
+                ));
+            }
+            return scanPhysicalIndexChunk(topicPartition, plan, readResult.nextLogOffset(), accumulator);
+        });
     }
 
     /**
@@ -386,6 +474,54 @@ public class GlobalSequenceCoordinator {
         Utils.closeQuietly(runtime, "coordinator runtime");
         Utils.closeQuietly(coordinatorMetrics, "global sequence coordinator metrics");
         log.info("Shutdown complete.");
+    }
+
+    private static final class PhysicalScanAccumulator {
+        private final PhysicalBatchId physicalBatchId;
+        private GlobalSequenceIndexRecord candidate;
+        private long bytesRead;
+
+        private PhysicalScanAccumulator(GlobalSequencePhysicalIndexScanPlan plan) {
+            this.physicalBatchId = plan.request().physicalBatchId();
+        }
+
+        private void addBytes(int bytes) {
+            bytesRead = Math.addExact(bytesRead, bytes);
+        }
+
+        private long bytesRead() {
+            return bytesRead;
+        }
+
+        private void add(List<GlobalSequenceIndexLogEntry> entries) {
+            for (GlobalSequenceIndexLogEntry entry : entries) {
+                if (!physicalBatchId.topicId().equals(entry.topicId())) {
+                    continue;
+                }
+                if (entry.indexRecord().isEmpty()) {
+                    if (candidate != null && candidate.globalBaseOffset() == entry.globalBaseOffset()) {
+                        candidate = null;
+                    }
+                    continue;
+                }
+
+                GlobalSequenceIndexRecord indexRecord = entry.indexRecord().get();
+                if (indexRecord.partitionIndex() != physicalBatchId.partitionIndex() ||
+                    indexRecord.partitionBaseOffset() != physicalBatchId.partitionBaseOffset()) {
+                    continue;
+                }
+                if (candidate != null && !candidate.equals(indexRecord)) {
+                    throw new IllegalStateException(
+                        "Conflicting global sequence allocations for physical batch " + physicalBatchId
+                    );
+                }
+                candidate = indexRecord;
+            }
+        }
+
+        private Optional<GlobalSequenceIndexRecord> result() {
+            return Optional.ofNullable(candidate);
+        }
     }
 
     private static final class ScanAccumulator {

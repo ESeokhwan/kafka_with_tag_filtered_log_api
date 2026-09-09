@@ -367,18 +367,23 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 @Override
                 public void run() {
                     String eventName = "Timeout(tp=" + tp + ", key=" + key + ")";
-                    CoordinatorWriteEvent<Void> event = new CoordinatorWriteEvent<>(eventName, tp, defaultWriteTimeout, coordinator -> {
-                        log.debug("Executing write event {} for timer {}.", eventName, key);
+                    CoordinatorWriteEvent<Void> event = new CoordinatorWriteEvent<>(
+                        eventName,
+                        tp,
+                        defaultWriteTimeout,
+                        (coordinator, offset, coordinatorEpoch) -> {
+                            log.debug("Executing write event {} for timer {}.", eventName, key);
 
-                        // If the task is different, it means that the timer has been
-                        // cancelled while the event was waiting to be processed.
-                        if (!tasks.remove(key, this)) {
-                            throw new RejectedExecutionException("Timer " + key + " was overridden or cancelled");
+                            // If the task is different, it means that the timer has been
+                            // cancelled while the event was waiting to be processed.
+                            if (!tasks.remove(key, this)) {
+                                throw new RejectedExecutionException("Timer " + key + " was overridden or cancelled");
+                            }
+
+                            // Execute the timeout operation.
+                            return operation.generateRecords();
                         }
-
-                        // Execute the timeout operation.
-                        return operation.generateRecords();
-                    });
+                    );
 
                     // If the write event fails, it is rescheduled with a small backoff except if retry
                     // is disabled or if the error is fatal.
@@ -1239,6 +1244,30 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
     }
 
     /**
+     * A coordinator write operation that also observes the committed offset and partition leader epoch.
+     *
+     * @param <S> The type of the coordinator state machine.
+     * @param <T> The type of the response.
+     * @param <U> The type of the records.
+     */
+    public interface CoordinatorWriteOperationWithEpoch<S, T, U> {
+        /**
+         * Generates the records needed to implement this coordinator write operation.
+         *
+         * @param coordinator       The coordinator state machine.
+         * @param offset            The last committed offset.
+         * @param coordinatorEpoch  The current partition leader epoch.
+         * @return A result containing a list of records and the RPC result.
+         * @throws KafkaException
+         */
+        CoordinatorResult<T, U> generateRecordsAndResult(
+            S coordinator,
+            long offset,
+            int coordinatorEpoch
+        ) throws KafkaException;
+    }
+
+    /**
      * A coordinator event that modifies the coordinator state.
      *
      * @param <T> The type of the response.
@@ -1283,7 +1312,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         /**
          * The write operation to execute.
          */
-        final CoordinatorWriteOperation<S, T, U> op;
+        final CoordinatorWriteOperationWithEpoch<S, T, U> op;
 
         /**
          * The future that will be completed with the response
@@ -1329,7 +1358,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             String name,
             TopicPartition tp,
             Duration writeTimeout,
-            CoordinatorWriteOperation<S, T, U> op
+            CoordinatorWriteOperationWithEpoch<S, T, U> op
         ) {
             this(
                 name,
@@ -1363,7 +1392,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             short producerEpoch,
             VerificationGuard verificationGuard,
             Duration writeTimeout,
-            CoordinatorWriteOperation<S, T, U> op
+            CoordinatorWriteOperationWithEpoch<S, T, U> op
         ) {
             this.tp = tp;
             this.name = name;
@@ -1396,7 +1425,11 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 // Get the context of the coordinator or fail if the coordinator is not in active state.
                 withActiveContextOrThrow(tp, context -> {
                     // Execute the operation.
-                    result = op.generateRecordsAndResult(context.coordinator.coordinator());
+                    result = op.generateRecordsAndResult(
+                        context.coordinator.coordinator(),
+                        context.coordinator.lastCommittedOffset(),
+                        context.epoch
+                    );
 
                     // Append the records and replay them to the state machine.
                     context.append(
@@ -2205,6 +2238,33 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         Duration timeout,
         CoordinatorWriteOperation<S, T, U> op
     ) {
+        return scheduleWriteOperationWithEpoch(
+            name,
+            tp,
+            timeout,
+            (coordinator, offset, coordinatorEpoch) -> op.generateRecordsAndResult(coordinator)
+        );
+    }
+
+    /**
+     * Schedules a write operation which also observes the committed offset and partition leader epoch.
+     *
+     * @param name      The name of the write operation.
+     * @param tp        The address of the coordinator (aka its topic-partitions).
+     * @param timeout   The write operation timeout.
+     * @param op        The write operation.
+     *
+     * @return A future that will be completed with the result of the write operation
+     * when the operation is completed or an exception if the write operation failed.
+     *
+     * @param <T> The type of the result.
+     */
+    public <T> CompletableFuture<T> scheduleWriteOperationWithEpoch(
+        String name,
+        TopicPartition tp,
+        Duration timeout,
+        CoordinatorWriteOperationWithEpoch<S, T, U> op
+    ) {
         throwIfNotRunning();
         log.debug("Scheduled execution of write operation {}.", name);
         CoordinatorWriteEvent<T> event = new CoordinatorWriteEvent<>(name, tp, timeout, op);
@@ -2282,7 +2342,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 producerEpoch,
                 verificationGuard,
                 timeout,
-                op
+                (coordinator, offset, coordinatorEpoch) -> op.generateRecordsAndResult(coordinator)
             );
             enqueueLast(event);
             return event.future;

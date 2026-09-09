@@ -827,6 +827,19 @@ public class CoordinatorRuntimeTest {
         assertTrue(write4.isDone());
         assertEquals("response4", write4.get(5, TimeUnit.SECONDS));
         assertEquals(List.of(3L), ctx.coordinator.snapshotRegistry().epochsList());
+
+        CompletableFuture<String> epochAwareWrite = runtime.scheduleWriteOperationWithEpoch(
+            "epoch-aware-write",
+            TP,
+            DEFAULT_WRITE_TIMEOUT,
+            (state, offset, coordinatorEpoch) -> {
+                assertEquals(3L, offset);
+                assertEquals(10, coordinatorEpoch);
+                return new CoordinatorResult<>(List.of(), "epoch-aware-response");
+            }
+        );
+        assertTrue(epochAwareWrite.isDone());
+        assertEquals("epoch-aware-response", epochAwareWrite.get(5, TimeUnit.SECONDS));
     }
 
     @Test

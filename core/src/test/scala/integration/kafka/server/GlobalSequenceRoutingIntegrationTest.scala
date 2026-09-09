@@ -29,7 +29,7 @@ import org.apache.kafka.common.record.Records
 import org.apache.kafka.common.requests.{FetchGlobalSequenceRequest, FetchGlobalSequenceResponse, LookupGlobalSequenceIndexRequest, LookupGlobalSequenceIndexResponse}
 import org.apache.kafka.common.test.api.{ClusterConfigProperty, ClusterTest, Type}
 import org.apache.kafka.common.test.{ClusterInstance, TestUtils}
-import org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinatorConfig
+import org.apache.kafka.coordinator.globalsequence.{GlobalSequenceAppendRequest, GlobalSequenceCoordinatorConfig}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue}
 
 import java.nio.charset.StandardCharsets
@@ -178,11 +178,25 @@ class GlobalSequenceRoutingIntegrationTest {
     }
 
     val indexTopicPartition = new TopicPartition(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME, indexPartition)
-    val indexLeader = cluster.brokers().get(indexLeaderId)
+    val indexLeader = cluster.brokers().get(indexLeaderId).asInstanceOf[BrokerServer]
     TestUtils.waitForCondition(
       () => indexLeader.replicaManager.localLog(indexTopicPartition).exists(_.logEndOffset >= 2L),
       "The remote index leader did not append both global sequence allocations"
     )
+
+    val oldRetry = new GlobalSequenceAppendRequest(dataTopicId, dataPartition, 0L, 1)
+    val retryThroughDataLeader = cluster.brokers().get(dataLeaderId).asInstanceOf[BrokerServer]
+      .globalSequenceIndexRoutingManager
+      .appendIndex(oldRetry)
+      .get(30, TimeUnit.SECONDS)
+    val retryThroughIndexLeader = indexLeader
+      .globalSequenceIndexRoutingManager
+      .appendIndex(oldRetry)
+      .get(30, TimeUnit.SECONDS)
+    assertTrue(retryThroughDataLeader.duplicate)
+    assertEquals(0L, retryThroughDataLeader.globalBaseOffset)
+    assertTrue(retryThroughIndexLeader.duplicate)
+    assertEquals(0L, retryThroughIndexLeader.globalBaseOffset)
 
     val lookupRequest = new LookupGlobalSequenceIndexRequest.Builder(
       new LookupGlobalSequenceIndexRequestData()
