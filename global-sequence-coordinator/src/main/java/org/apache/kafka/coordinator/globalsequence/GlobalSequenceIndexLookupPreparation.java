@@ -20,30 +20,31 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * A committed in-memory lookup result or a bounded index-log scan range.
+ * The result of preparing a lookup on the coordinator event thread.
  */
-public record GlobalSequenceIndexLookupPlan(
+record GlobalSequenceIndexLookupPreparation(
     Optional<GlobalSequenceLookupResult> cachedResult,
-    long startIndexLogOffset,
-    long endIndexLogOffsetExclusive
+    Optional<GlobalSequenceIndexScanPlan> scanPlan
 ) {
-    public GlobalSequenceIndexLookupPlan {
+    GlobalSequenceIndexLookupPreparation {
         Objects.requireNonNull(cachedResult, "cachedResult");
-        if (startIndexLogOffset < 0) {
-            throw new IllegalArgumentException("startIndexLogOffset must not be negative");
-        }
-        if (endIndexLogOffsetExclusive < startIndexLogOffset) {
-            throw new IllegalArgumentException(
-                "endIndexLogOffsetExclusive must not be smaller than startIndexLogOffset"
-            );
+        Objects.requireNonNull(scanPlan, "scanPlan");
+        if (cachedResult.isPresent() == scanPlan.isPresent()) {
+            throw new IllegalArgumentException("Exactly one of cachedResult or scanPlan must be present");
         }
     }
 
-    public static GlobalSequenceIndexLookupPlan cached(GlobalSequenceLookupResult result, long highWatermark) {
-        return new GlobalSequenceIndexLookupPlan(Optional.of(result), highWatermark, highWatermark);
+    static GlobalSequenceIndexLookupPreparation cached(GlobalSequenceLookupResult result) {
+        return new GlobalSequenceIndexLookupPreparation(
+            Optional.of(Objects.requireNonNull(result, "result")),
+            Optional.empty()
+        );
     }
 
-    public static GlobalSequenceIndexLookupPlan scan(long startIndexLogOffset, long highWatermark) {
-        return new GlobalSequenceIndexLookupPlan(Optional.empty(), startIndexLogOffset, highWatermark);
+    static GlobalSequenceIndexLookupPreparation scan(GlobalSequenceIndexScanPlan plan) {
+        return new GlobalSequenceIndexLookupPreparation(
+            Optional.empty(),
+            Optional.of(Objects.requireNonNull(plan, "plan"))
+        );
     }
 }

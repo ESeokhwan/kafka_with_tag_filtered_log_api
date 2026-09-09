@@ -1648,6 +1648,19 @@ public class CoordinatorRuntimeTest {
         // The read is completed immediately.
         assertTrue(read.isDone());
         assertEquals("read-response", read.get(5, TimeUnit.SECONDS));
+
+        CompletableFuture<String> epochAwareRead = runtime.scheduleReadOperationWithEpoch(
+            "epoch-aware-read",
+            TP,
+            (state, offset, coordinatorEpoch) -> {
+                assertEquals(ctx.coordinator.lastCommittedOffset(), offset);
+                assertEquals(10, coordinatorEpoch);
+                return "epoch-aware-read-response";
+            }
+        );
+
+        assertTrue(epochAwareRead.isDone());
+        assertEquals("epoch-aware-read-response", epochAwareRead.get(5, TimeUnit.SECONDS));
     }
 
     @Test

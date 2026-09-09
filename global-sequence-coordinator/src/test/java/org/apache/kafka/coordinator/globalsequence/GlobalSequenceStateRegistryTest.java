@@ -494,22 +494,15 @@ class GlobalSequenceStateRegistryTest {
         snapshotRegistry.idempotentCreateSnapshot(103L);
 
         assertEquals(2, registry.retainedAllocationCount(SnapshotRegistry.LATEST_EPOCH));
+        GlobalSequenceLookupRequest evictedLookup = new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 1L);
+        assertTrue(registry.lookupRetained(evictedLookup, 103L).isEmpty());
+        assertEquals(100L, registry.scanStartIndexLogOffset(evictedLookup, 103L));
         assertEquals(
-            GlobalSequenceIndexLookupPlan.scan(100L, 103L),
-            registry.prepareLookup(
-                new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 1L),
-                103L
-            )
-        );
-        assertEquals(
-            GlobalSequenceIndexLookupPlan.cached(
-                new GlobalSequenceLookupResult(List.of(third)),
-                103L
-            ),
-            registry.prepareLookup(
+            new GlobalSequenceLookupResult(List.of(third)),
+            registry.lookupRetained(
                 new GlobalSequenceLookupRequest(TOPIC_ID, 2L, 3L),
                 103L
-            )
+            ).orElseThrow()
         );
         assertEquals(3L, registry.getState(TOPIC_ID).nextGlobalOffset());
 

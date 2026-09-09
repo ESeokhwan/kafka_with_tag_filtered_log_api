@@ -19,6 +19,7 @@ package org.apache.kafka.coordinator.globalsequence;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.protocol.ApiMessage;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.TransactionResult;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
@@ -42,6 +43,7 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 import org.slf4j.Logger;
 
 import java.util.List;
+import java.util.Optional;
 
 public class GlobalSequenceCoordinatorShard implements CoordinatorShard<CoordinatorRecord> {
 
@@ -199,41 +201,78 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     }
 
     GlobalSequenceLookupResult lookupIndex(GlobalSequenceLookupRequest request, long indexLogHighWatermark) {
-        GlobalSequenceIndexLookupPlan plan = prepareLookup(request, indexLogHighWatermark);
-        return plan.cachedResult().orElseThrow(() ->
-            GlobalSequenceStateRegistry.outOfRange(request, request.globalStartOffset())
-        );
+        int maxIndexEntries = Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries());
+        return lookupCached(request, maxIndexEntries).orElseGet(() -> {
+            GlobalSequenceLookupResult result = stateRegistry.lookup(request, indexLogHighWatermark);
+            return cacheAndRecordLookup(result, request);
+        });
     }
 
-    GlobalSequenceIndexLookupPlan prepareLookup(
+    GlobalSequenceIndexLookupPreparation prepareLookup(
         GlobalSequenceLookupRequest request,
-        long indexLogHighWatermark
+        long indexLogHighWatermark,
+        int coordinatorLeaderEpoch
     ) {
-        GlobalSequenceIndexLookupPlan plan = stateRegistry.prepareLookup(request, indexLogHighWatermark);
-        if (plan.cachedResult().isPresent()) {
-            recordLookup(plan.cachedResult().get(), request);
-            return plan;
+        int maxIndexEntries = Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries());
+        Optional<GlobalSequenceLookupResult> cachedResult = lookupCached(request, maxIndexEntries);
+        if (cachedResult.isPresent()) {
+            return GlobalSequenceIndexLookupPreparation.cached(cachedResult.get());
         }
 
-        int maxIndexEntries = Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries());
-        long cacheHitCount = indexCache.hitCount();
-        return indexCache.lookup(request, maxIndexEntries)
-            .map(result -> {
-                metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_HITS_SENSOR_NAME);
-                recordLookup(result, request);
-                return GlobalSequenceIndexLookupPlan.cached(result, indexLogHighWatermark);
-            })
-            .orElseGet(() -> {
-                if (indexCache.hitCount() == cacheHitCount) {
-                    metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_MISSES_SENSOR_NAME);
-                }
-                return plan;
-            });
+        Optional<GlobalSequenceLookupResult> retainedResult = stateRegistry.lookupRetained(
+            request,
+            indexLogHighWatermark
+        );
+        if (retainedResult.isPresent()) {
+            return GlobalSequenceIndexLookupPreparation.cached(
+                cacheAndRecordLookup(retainedResult.get(), request)
+            );
+        }
+
+        long startIndexLogOffset = stateRegistry.scanStartIndexLogOffset(request, indexLogHighWatermark);
+        return GlobalSequenceIndexLookupPreparation.scan(new GlobalSequenceIndexScanPlan(
+            request.topicId(),
+            request.globalStartOffset(),
+            request.globalEndOffsetExclusive(),
+            startIndexLogOffset,
+            indexLogHighWatermark,
+            coordinatorLeaderEpoch,
+            maxIndexEntries
+        ));
     }
 
     GlobalSequenceLookupResult completeLookup(
+        GlobalSequenceIndexScanPlan plan,
+        GlobalSequenceLookupResult result,
+        int currentCoordinatorLeaderEpoch
+    ) {
+        if (currentCoordinatorLeaderEpoch != plan.coordinatorLeaderEpoch()) {
+            throw Errors.NOT_COORDINATOR.exception(
+                "Discarding a global sequence index scan captured at coordinator leader epoch " +
+                    plan.coordinatorLeaderEpoch() + " because the current epoch is " +
+                    currentCoordinatorLeaderEpoch
+            );
+        }
+        return cacheAndRecordLookup(result, plan.request());
+    }
+
+    private Optional<GlobalSequenceLookupResult> lookupCached(
         GlobalSequenceLookupRequest request,
-        GlobalSequenceLookupResult result
+        int maxIndexEntries
+    ) {
+        Optional<GlobalSequenceLookupResult> result = indexCache.lookup(request, maxIndexEntries);
+        if (result.isPresent()) {
+            metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_HITS_SENSOR_NAME);
+            recordLookup(result.get(), request);
+        } else {
+            metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_MISSES_SENSOR_NAME);
+        }
+        return result;
+    }
+
+    private GlobalSequenceLookupResult cacheAndRecordLookup(
+        GlobalSequenceLookupResult result,
+        GlobalSequenceLookupRequest request
     ) {
         long evictionsBefore = indexCache.evictionCount();
         result.indexRecords().forEach(indexCache::put);

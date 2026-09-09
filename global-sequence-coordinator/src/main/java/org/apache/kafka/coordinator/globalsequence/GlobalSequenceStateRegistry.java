@@ -168,11 +168,12 @@ public class GlobalSequenceStateRegistry {
     }
 
     GlobalSequenceLookupResult lookup(GlobalSequenceLookupRequest request, long indexLogHighWatermark) {
-        GlobalSequenceIndexLookupPlan plan = prepareLookup(request, indexLogHighWatermark);
-        return plan.cachedResult().orElseThrow(() -> outOfRange(request, request.globalStartOffset()));
+        return lookupRetained(request, indexLogHighWatermark).orElseThrow(() ->
+            outOfRange(request, request.globalStartOffset())
+        );
     }
 
-    GlobalSequenceIndexLookupPlan prepareLookup(
+    Optional<GlobalSequenceLookupResult> lookupRetained(
         GlobalSequenceLookupRequest request,
         long indexLogHighWatermark
     ) {
@@ -181,15 +182,18 @@ public class GlobalSequenceStateRegistry {
         if (state == null) {
             throw outOfRange(request, request.globalStartOffset());
         }
-        Optional<GlobalSequenceLookupResult> retainedResult = state.lookupRetained(
+        return state.lookupRetained(
             request,
             indexLogHighWatermark,
             Math.min(request.maxIndexEntries(), maxLookupIndexEntries)
         );
-        if (retainedResult.isPresent()) {
-            return GlobalSequenceIndexLookupPlan.cached(retainedResult.get(), indexLogHighWatermark);
-        }
+    }
 
+    long scanStartIndexLogOffset(
+        GlobalSequenceLookupRequest request,
+        long indexLogHighWatermark
+    ) {
+        Objects.requireNonNull(request, "request");
         GlobalSequenceIndexCheckpoint checkpoint = checkpointIndex.floor(
             request.topicId(),
             request.globalStartOffset(),
@@ -198,7 +202,7 @@ public class GlobalSequenceStateRegistry {
         if (checkpoint.indexLogOffset() >= indexLogHighWatermark) {
             throw outOfRange(request, request.globalStartOffset());
         }
-        return GlobalSequenceIndexLookupPlan.scan(checkpoint.indexLogOffset(), indexLogHighWatermark);
+        return checkpoint.indexLogOffset();
     }
 
     int retainedAllocationCount(long epoch) {

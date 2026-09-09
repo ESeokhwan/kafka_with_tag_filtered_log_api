@@ -261,23 +261,23 @@ public class GlobalSequenceCoordinator {
     ) {
         throwIfNotActive();
         TopicPartition topicPartition = topicPartitionFor(request.topicId());
-        return runtime.<GlobalSequenceIndexLookupPlan>scheduleReadOperation(
+        return runtime.<GlobalSequenceIndexLookupPreparation>scheduleReadOperationWithEpoch(
             "prepare-global-sequence-index-lookup",
             topicPartition,
-            (coordinator, indexLogHighWatermark) -> coordinator.prepareLookup(request, indexLogHighWatermark)
-        ).thenCompose(plan -> {
-            if (plan.cachedResult().isPresent()) {
-                return CompletableFuture.completedFuture(plan.cachedResult().get());
+            (coordinator, indexLogHighWatermark, coordinatorLeaderEpoch) ->
+                coordinator.prepareLookup(request, indexLogHighWatermark, coordinatorLeaderEpoch)
+        ).thenCompose(preparation -> {
+            if (preparation.cachedResult().isPresent()) {
+                return CompletableFuture.completedFuture(preparation.cachedResult().get());
             }
-            ScanAccumulator accumulator = new ScanAccumulator(
-                request,
-                Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries())
-            );
+            GlobalSequenceIndexScanPlan plan = preparation.scanPlan().orElseThrow();
+            ScanAccumulator accumulator = new ScanAccumulator(plan);
             return scanIndex(topicPartition, plan, accumulator).thenCompose(result ->
-                runtime.scheduleReadOperation(
+                runtime.scheduleReadOperationWithEpoch(
                     "complete-global-sequence-index-lookup",
                     topicPartition,
-                    (coordinator, ignoredHighWatermark) -> coordinator.completeLookup(request, result)
+                    (coordinator, ignoredHighWatermark, currentCoordinatorLeaderEpoch) ->
+                        coordinator.completeLookup(plan, result, currentCoordinatorLeaderEpoch)
                 )
             );
         });
@@ -285,7 +285,7 @@ public class GlobalSequenceCoordinator {
 
     private CompletableFuture<GlobalSequenceLookupResult> scanIndex(
         TopicPartition topicPartition,
-        GlobalSequenceIndexLookupPlan plan,
+        GlobalSequenceIndexScanPlan plan,
         ScanAccumulator accumulator
     ) {
         return scanIndexChunk(topicPartition, plan, plan.startIndexLogOffset(), accumulator);
@@ -293,7 +293,7 @@ public class GlobalSequenceCoordinator {
 
     private CompletableFuture<GlobalSequenceLookupResult> scanIndexChunk(
         TopicPartition topicPartition,
-        GlobalSequenceIndexLookupPlan plan,
+        GlobalSequenceIndexScanPlan plan,
         long nextLogOffset,
         ScanAccumulator accumulator
     ) {
@@ -302,7 +302,7 @@ public class GlobalSequenceCoordinator {
         return indexLogReader.read(
             topicPartition,
             nextLogOffset,
-            plan.endIndexLogOffsetExclusive(),
+            plan.capturedHighWatermark(),
             readMaxBytes
         ).thenCompose(readResult -> {
             coordinatorMetrics.record(GlobalSequenceCoordinatorMetrics.INDEX_LOG_READS_SENSOR_NAME);
@@ -394,9 +394,9 @@ public class GlobalSequenceCoordinator {
         private final TreeMap<Long, GlobalSequenceIndexRecord> candidates = new TreeMap<>();
         private long bytesRead;
 
-        private ScanAccumulator(GlobalSequenceLookupRequest request, int maxIndexEntries) {
-            this.request = request;
-            this.maxIndexEntries = maxIndexEntries;
+        private ScanAccumulator(GlobalSequenceIndexScanPlan plan) {
+            this.request = plan.request();
+            this.maxIndexEntries = plan.maxIndexEntries();
         }
 
         private void addBytes(int bytes) {

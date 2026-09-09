@@ -18,6 +18,7 @@ package org.apache.kafka.coordinator.globalsequence;
 
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.common.errors.NotCoordinatorException;
 import org.apache.kafka.common.errors.OffsetOutOfRangeException;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.utils.LogContext;
@@ -272,6 +273,102 @@ class GlobalSequenceCoordinatorShardTest {
                 new GlobalSequenceLookupRequest(TOPIC_ID, 1L, 5L),
                 SnapshotRegistry.LATEST_EPOCH
             )
+        );
+    }
+
+    @Test
+    void testCompleteLookupDiscardsResultFromOldCoordinatorEpoch() {
+        GlobalSequenceLookupRequest request = new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 1L);
+        GlobalSequenceIndexScanPlan plan = new GlobalSequenceIndexScanPlan(
+            TOPIC_ID,
+            0L,
+            1L,
+            0L,
+            10L,
+            7,
+            1
+        );
+        GlobalSequenceLookupResult result = new GlobalSequenceLookupResult(List.of(
+            new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 1, 0, 20L)
+        ));
+
+        assertThrows(NotCoordinatorException.class, () -> shard.completeLookup(plan, result, 8));
+        assertThrows(
+            OffsetOutOfRangeException.class,
+            () -> shard.prepareLookup(request, SnapshotRegistry.LATEST_EPOCH, 8)
+        );
+    }
+
+    @Test
+    void testPrepareLookupBuildsSelfContainedScanPlanAfterCacheMiss() {
+        LogContext logContext = new LogContext();
+        MockTime time = new MockTime();
+        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(logContext);
+        GlobalSequenceCoordinatorConfig config = new GlobalSequenceCoordinatorConfig(new AbstractConfig(
+            GlobalSequenceCoordinatorConfig.CONFIG_DEF,
+            Map.of(GlobalSequenceCoordinatorConfig.MAX_LOOKUP_INDEX_ENTRIES_CONFIG, 2)
+        ));
+        GlobalSequenceCoordinatorShard boundedShard = new GlobalSequenceCoordinatorShard(
+            logContext,
+            new GlobalSequenceStateRegistry(snapshotRegistry, 2, 1, 1, 2),
+            new GlobalSequenceIndexCache(config.indexCacheMaxEntries()),
+            time,
+            new MockCoordinatorTimer<>(time),
+            config,
+            mock(CoordinatorMetrics.class),
+            mock(CoordinatorMetricsShard.class)
+        );
+        GlobalSequenceIndexRecord first = new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 1, 0, 20L);
+        GlobalSequenceIndexRecord second = new GlobalSequenceIndexRecord(TOPIC_ID, 1L, 1, 1, 30L);
+        boundedShard.replay(
+            4L,
+            RecordBatch.NO_PRODUCER_ID,
+            RecordBatch.NO_PRODUCER_EPOCH,
+            coordinatorRecord(first)
+        );
+        boundedShard.replay(
+            5L,
+            RecordBatch.NO_PRODUCER_ID,
+            RecordBatch.NO_PRODUCER_EPOCH,
+            coordinatorRecord(second)
+        );
+        snapshotRegistry.idempotentCreateSnapshot(6L);
+
+        GlobalSequenceLookupRequest request = new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 2L, 10);
+        assertEquals(
+            GlobalSequenceIndexLookupPreparation.scan(new GlobalSequenceIndexScanPlan(
+                TOPIC_ID,
+                0L,
+                2L,
+                4L,
+                6L,
+                7,
+                2
+            )),
+            boundedShard.prepareLookup(request, 6L, 7)
+        );
+    }
+
+    @Test
+    void testPrepareLookupChecksPageCacheBeforeSnapshotState() {
+        GlobalSequenceLookupRequest request = new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 1L);
+        GlobalSequenceIndexScanPlan plan = new GlobalSequenceIndexScanPlan(
+            TOPIC_ID,
+            0L,
+            1L,
+            0L,
+            10L,
+            7,
+            1
+        );
+        GlobalSequenceLookupResult result = new GlobalSequenceLookupResult(List.of(
+            new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 1, 0, 20L)
+        ));
+        shard.completeLookup(plan, result, 7);
+
+        assertEquals(
+            GlobalSequenceIndexLookupPreparation.cached(result),
+            shard.prepareLookup(request, 10L, 7)
         );
     }
 

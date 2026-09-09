@@ -1489,6 +1489,25 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
     }
 
     /**
+     * A coordinator read operation that also observes the partition leader epoch.
+     *
+     * @param <S> The type of the coordinator state machine.
+     * @param <T> The type of the response.
+     */
+    public interface CoordinatorReadOperationWithEpoch<S, T> {
+        /**
+         * Generates the response to implement this coordinator read operation.
+         *
+         * @param state              The coordinator state machine.
+         * @param offset             The last committed offset.
+         * @param coordinatorEpoch   The current partition leader epoch.
+         * @return A response.
+         * @throws KafkaException
+         */
+        T generateResponse(S state, long offset, int coordinatorEpoch) throws KafkaException;
+    }
+
+    /**
      * A coordinator that reads the committed coordinator state.
      *
      * @param <T> The type of the response.
@@ -1507,7 +1526,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         /**
          * The read operation to execute.
          */
-        final CoordinatorReadOperation<S, T> op;
+        final CoordinatorReadOperationWithEpoch<S, T> op;
 
         /**
          * The future that will be completed with the response
@@ -1536,7 +1555,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         CoordinatorReadEvent(
             String name,
             TopicPartition tp,
-            CoordinatorReadOperation<S, T> op
+            CoordinatorReadOperationWithEpoch<S, T> op
         ) {
             this.tp = tp;
             this.name = name;
@@ -1565,7 +1584,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                     // Execute the read operation.
                     response = op.generateResponse(
                         context.coordinator.coordinator(),
-                        context.coordinator.lastCommittedOffset()
+                        context.coordinator.lastCommittedOffset(),
+                        context.epoch
                     );
 
                     // The response can be completed immediately.
@@ -2323,6 +2343,30 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         String name,
         TopicPartition tp,
         CoordinatorReadOperation<S, T> op
+    ) {
+        return scheduleReadOperationWithEpoch(
+            name,
+            tp,
+            (state, offset, coordinatorEpoch) -> op.generateResponse(state, offset)
+        );
+    }
+
+    /**
+     * Schedules a read operation which also observes the current partition leader epoch.
+     *
+     * @param name  The name of the read operation.
+     * @param tp    The address of the coordinator (aka its topic-partitions).
+     * @param op    The read operation.
+     *
+     * @return A future that will be completed with the result of the read operation
+     * when the operation is completed or an exception if the read operation failed.
+     *
+     * @param <T> The type of the result.
+     */
+    public <T> CompletableFuture<T> scheduleReadOperationWithEpoch(
+        String name,
+        TopicPartition tp,
+        CoordinatorReadOperationWithEpoch<S, T> op
     ) {
         throwIfNotRunning();
         log.debug("Scheduled execution of read operation {}.", name);
