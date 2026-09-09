@@ -91,6 +91,27 @@ class ReplicaManagerGlobalSequenceIndexLogReaderTest {
   }
 
   @Test
+  def testAdvancesAcrossCompactedOffsetHole(): Unit = {
+    val replicaManager = mock(classOf[ReplicaManager])
+    val log = mock(classOf[UnifiedLog])
+    val allocation = new GlobalSequenceIndexRecord(topicId, 10L, 3, 2, 50L)
+    val records = MemoryRecords.withRecords(8L, Compression.NONE, serialized(allocationRecord(allocation)))
+
+    when(replicaManager.getLog(topicPartition)).thenReturn(Some(log))
+    when(log.read(5L, 128, FetchIsolation.HIGH_WATERMARK, true))
+      .thenReturn(new FetchDataInfo(new LogOffsetMetadata(8L), records))
+
+    Using.resource(new ReplicaManagerGlobalSequenceIndexLogReader(replicaManager, 128)) { reader =>
+      val result = reader.read(topicPartition, 5L, 10L, 128).get(10, TimeUnit.SECONDS)
+
+      assertEquals(Seq(GlobalSequenceIndexLogEntry.allocation(8L, allocation)), result.entries.toArray.toSeq)
+      assertEquals(9L, result.nextLogOffset)
+      assertFalse(result.reachedEndOffset)
+      verify(log).read(5L, 128, FetchIsolation.HIGH_WATERMARK, true)
+    }
+  }
+
+  @Test
   def testFailsWhenLocalLogIsUnavailable(): Unit = {
     val replicaManager = mock(classOf[ReplicaManager])
     when(replicaManager.getLog(topicPartition)).thenReturn(None)

@@ -22,9 +22,11 @@ import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.timeline.SnapshotRegistry;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -131,6 +133,55 @@ class GlobalSequenceStateRegistryTest {
                 SnapshotRegistry.LATEST_EPOCH
             ));
         }
+    }
+
+    @Test
+    @Timeout(60)
+    void testMillionsOfCommittedAllocationsKeepOnlyBoundedState() {
+        int allocationCount = 2_000_000;
+        int partitionCount = 100;
+        int cacheCapacity = 4_096;
+        GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(
+            new SnapshotRegistry(new LogContext())
+        );
+        GlobalSequenceIndexCache cache = new GlobalSequenceIndexCache(cacheCapacity);
+
+        for (int allocation = 0; allocation < allocationCount; allocation++) {
+            GlobalSequenceIndexRecord indexRecord = record(
+                TOPIC_ID,
+                allocation,
+                1,
+                allocation % partitionCount,
+                allocation / partitionCount
+            );
+            registry.replay(indexRecord, allocation * 2L, false);
+            cache.put(indexRecord);
+        }
+
+        assertEquals(Set.of(TOPIC_ID), registry.topicIds());
+        assertEquals(allocationCount, registry.getState(TOPIC_ID).nextGlobalOffset());
+        assertEquals(partitionCount, registry.getState(TOPIC_ID).latestPhysicalOffsetCount());
+        assertEquals(0, registry.uncommittedAllocationCount());
+        assertTrue(registry.checkpointCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH) < 64);
+        for (int partitionIndex = 0; partitionIndex < partitionCount; partitionIndex++) {
+            assertTrue(
+                registry.physicalCheckpointCount(
+                    TOPIC_ID,
+                    partitionIndex,
+                    SnapshotRegistry.LATEST_EPOCH
+                ) < 32
+            );
+        }
+
+        assertEquals(cacheCapacity, cache.size());
+        assertEquals(allocationCount - cacheCapacity, cache.evictionCount());
+        assertFalse(cache.getByPhysicalBatch(new PhysicalBatchId(TOPIC_ID, 0, 0L)).isPresent());
+        int newestAllocation = allocationCount - 1;
+        assertTrue(cache.getByPhysicalBatch(new PhysicalBatchId(
+            TOPIC_ID,
+            newestAllocation % partitionCount,
+            newestAllocation / partitionCount
+        )).isPresent());
     }
 
     @Test

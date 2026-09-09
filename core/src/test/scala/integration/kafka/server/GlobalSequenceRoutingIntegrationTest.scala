@@ -19,7 +19,7 @@ package kafka.server
 import kafka.server.IntegrationTestUtils.connectAndReceive
 import org.apache.kafka.clients.admin.NewTopic
 import org.apache.kafka.clients.producer.ProducerRecord
-import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.{TopicPartition, Uuid}
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.TopicConfig
 import org.apache.kafka.common.internals.Topic
@@ -278,6 +278,271 @@ class GlobalSequenceRoutingIntegrationTest {
     assertEquals(1L, nextFetchResponse.data.batches.get(0).globalBaseOffset)
     assertEquals("second", firstValue(nextFetchResponse.data.batches.get(0).records.asInstanceOf[Records]))
   }
+
+  @ClusterTest(
+    types = Array(Type.KRAFT),
+    brokers = 3,
+    controllers = 1,
+    serverProperties = Array(
+      new ClusterConfigProperty(
+        key = GlobalSequenceCoordinatorConfig.NUM_INDEX_PARTITIONS_CONFIG,
+        value = "1"
+      ),
+      new ClusterConfigProperty(
+        key = GlobalSequenceCoordinatorConfig.INDEX_TOPIC_REPLICATION_FACTOR_CONFIG,
+        value = "3"
+      ),
+      new ClusterConfigProperty(
+        key = GlobalSequenceCoordinatorConfig.INDEX_TOPIC_MIN_ISR_CONFIG,
+        value = "2"
+      ),
+      new ClusterConfigProperty(
+        key = GlobalSequenceCoordinatorConfig.INDEX_CACHE_MAX_ENTRIES_CONFIG,
+        value = "1"
+      ),
+      new ClusterConfigProperty(
+        key = GlobalSequenceCoordinatorConfig.INDEX_CHECKPOINT_INTERVAL_CONFIG,
+        value = "1"
+      )
+    )
+  )
+  def testLogBackedLookupRecoversAcrossLeaderRestart(cluster: ClusterInstance): Unit = {
+    val brokerIds = cluster.brokerIds.asScala.toSeq.sorted
+    val dataLeaderId = brokerIds.head
+    val replacementIndexLeaderId = brokerIds(1)
+    val initialIndexLeaderId = brokerIds.last
+    val dataTopic = "global-sequence-recovery"
+    val dataPartition = 0
+    val recordCount = 30
+
+    val dataTopicDefinition = new NewTopic(dataTopic, util.Map.of(
+      Integer.valueOf(dataPartition),
+      brokerIds.map(id => Integer.valueOf(id)).asJava
+    )).configs(util.Map.of(TopicConfig.GLOBAL_SEQUENCE_ENABLED_CONFIG, "true"))
+    val indexTopicDefinition = new NewTopic(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME, util.Map.of(
+      Integer.valueOf(0),
+      Seq(initialIndexLeaderId, replacementIndexLeaderId, dataLeaderId)
+        .map(id => Integer.valueOf(id)).asJava
+    )).configs(util.Map.of(
+      TopicConfig.CLEANUP_POLICY_CONFIG,
+      TopicConfig.CLEANUP_POLICY_COMPACT,
+      TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG,
+      "2"
+    ))
+
+    val admin = cluster.admin()
+    val dataTopicId = try {
+      admin.createTopics(util.List.of(dataTopicDefinition, indexTopicDefinition))
+        .all()
+        .get(30, TimeUnit.SECONDS)
+      cluster.waitForTopic(dataTopic, 1)
+      cluster.waitForTopic(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME, 1)
+      admin.describeTopics(util.List.of(dataTopic))
+        .allTopicNames()
+        .get(30, TimeUnit.SECONDS)
+        .get(dataTopic)
+        .topicId()
+    } finally {
+      admin.close()
+    }
+
+    val producer = cluster.producer[Array[Byte], Array[Byte]]()
+    try {
+      (0 until recordCount).foreach { index =>
+        producer.send(new ProducerRecord(
+          dataTopic,
+          dataPartition,
+          null,
+          s"record-$index".getBytes(StandardCharsets.UTF_8)
+        )).get(30, TimeUnit.SECONDS)
+      }
+    } finally {
+      producer.close()
+    }
+
+    var initialLeaderStopped = false
+    var replacementLeaderStopped = false
+    try {
+      cluster.shutdownBroker(initialIndexLeaderId)
+      initialLeaderStopped = true
+      waitForIndexLeader(cluster, replacementIndexLeaderId)
+
+      val lookupAfterReelection = waitForSuccessfulLookup(
+        cluster,
+        dataLeaderId,
+        dataTopicId,
+        0L,
+        recordCount.toLong,
+        1
+      )
+      assertEquals(1, lookupAfterReelection.data.indexEntries.size)
+      assertEquals(0L, lookupAfterReelection.data.indexEntries.get(0).globalBaseOffset)
+      assertEquals(1L, lookupAfterReelection.data.nextGlobalOffset)
+      assertTrue(lookupAfterReelection.data.hasMore)
+
+      cluster.startBroker(initialIndexLeaderId)
+      initialLeaderStopped = false
+      waitForIndexReplica(cluster, initialIndexLeaderId)
+
+      cluster.shutdownBroker(replacementIndexLeaderId)
+      replacementLeaderStopped = true
+      waitForIndexLeader(cluster, initialIndexLeaderId)
+
+      val oldRetry = cluster.brokers().get(dataLeaderId).asInstanceOf[BrokerServer]
+        .globalSequenceIndexRoutingManager
+        .appendIndex(new GlobalSequenceAppendRequest(dataTopicId, dataPartition, 0L, 1))
+        .get(30, TimeUnit.SECONDS)
+      assertTrue(oldRetry.duplicate)
+      assertEquals(0L, oldRetry.globalBaseOffset)
+
+      val fetchAfterRestart = waitForSuccessfulFetch(
+        cluster,
+        initialIndexLeaderId,
+        dataTopicId,
+        0L,
+        recordCount.toLong,
+        1
+      )
+      assertEquals(1, fetchAfterRestart.data.batches.size)
+      assertEquals(0L, fetchAfterRestart.data.batches.get(0).globalBaseOffset)
+      assertEquals(1L, fetchAfterRestart.data.nextGlobalOffset)
+      assertEquals(
+        "record-0",
+        firstValue(fetchAfterRestart.data.batches.get(0).records.asInstanceOf[Records])
+      )
+    } finally {
+      if (initialLeaderStopped) cluster.startBroker(initialIndexLeaderId)
+      if (replacementLeaderStopped) cluster.startBroker(replacementIndexLeaderId)
+    }
+  }
+
+  private def waitForIndexLeader(cluster: ClusterInstance, expectedLeaderId: Int): Unit = {
+    val admin = cluster.admin()
+    try {
+      TestUtils.waitForCondition(
+        booleanSupplier {
+          try {
+            val description = admin.describeTopics(util.List.of(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME))
+              .allTopicNames()
+              .get(5, TimeUnit.SECONDS)
+              .get(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME)
+            description.partitions().get(0).leader().id() == expectedLeaderId
+          } catch {
+            case _: Exception => false
+          }
+        },
+        60_000L,
+        s"Broker $expectedLeaderId did not become the global sequence index leader"
+      )
+    } finally {
+      admin.close()
+    }
+  }
+
+  private def waitForIndexReplica(cluster: ClusterInstance, expectedReplicaId: Int): Unit = {
+    val admin = cluster.admin()
+    try {
+      TestUtils.waitForCondition(
+        booleanSupplier {
+          try {
+            val description = admin.describeTopics(util.List.of(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME))
+              .allTopicNames()
+              .get(5, TimeUnit.SECONDS)
+              .get(Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME)
+            description.partitions().get(0).isr().asScala.exists(_.id() == expectedReplicaId)
+          } catch {
+            case _: Exception => false
+          }
+        },
+        60_000L,
+        s"Broker $expectedReplicaId did not rejoin the global sequence index ISR"
+      )
+    } finally {
+      admin.close()
+    }
+  }
+
+  private def waitForSuccessfulLookup(
+    cluster: ClusterInstance,
+    brokerId: Int,
+    topicId: Uuid,
+    startOffset: Long,
+    endOffsetExclusive: Long,
+    maxIndexEntries: Int
+  ): LookupGlobalSequenceIndexResponse = {
+    var result: LookupGlobalSequenceIndexResponse = null
+    TestUtils.waitForCondition(
+      booleanSupplier {
+        try {
+          val response = connectAndReceive[LookupGlobalSequenceIndexResponse](
+            new LookupGlobalSequenceIndexRequest.Builder(
+              new LookupGlobalSequenceIndexRequestData()
+                .setTopicId(topicId)
+                .setGlobalStartOffset(startOffset)
+                .setGlobalEndOffsetExclusive(endOffsetExclusive)
+                .setMaxIndexEntries(maxIndexEntries)
+            ).build(),
+            cluster.brokers().get(brokerId).socketServer,
+            cluster.clientListener()
+          )
+          if (response.data.errorCode == Errors.NONE.code) {
+            result = response
+            true
+          } else {
+            false
+          }
+        } catch {
+          case _: Exception => false
+        }
+      },
+      60_000L,
+      "Global sequence index lookup did not recover"
+    )
+    result
+  }
+
+  private def waitForSuccessfulFetch(
+    cluster: ClusterInstance,
+    brokerId: Int,
+    topicId: Uuid,
+    startOffset: Long,
+    endOffsetExclusive: Long,
+    maxIndexEntries: Int
+  ): FetchGlobalSequenceResponse = {
+    var result: FetchGlobalSequenceResponse = null
+    TestUtils.waitForCondition(
+      booleanSupplier {
+        try {
+          val response = connectAndReceive[FetchGlobalSequenceResponse](
+            new FetchGlobalSequenceRequest.Builder(
+              new FetchGlobalSequenceRequestData()
+                .setTopicId(topicId)
+                .setGlobalStartOffset(startOffset)
+                .setGlobalEndOffsetExclusive(endOffsetExclusive)
+                .setMaxBytes(1024 * 1024)
+                .setMaxIndexEntries(maxIndexEntries)
+            ).build(),
+            cluster.brokers().get(brokerId).socketServer,
+            cluster.clientListener()
+          )
+          if (response.data.errorCode == Errors.NONE.code) {
+            result = response
+            true
+          } else {
+            false
+          }
+        } catch {
+          case _: Exception => false
+        }
+      },
+      60_000L,
+      "Global fetch did not recover"
+    )
+    result
+  }
+
+  private def booleanSupplier(condition: => Boolean): java.util.function.Supplier[java.lang.Boolean] =
+    () => java.lang.Boolean.valueOf(condition)
 
   private def firstValue(records: Records): String = {
     val record = records.records().iterator().next()

@@ -456,5 +456,9 @@ public class GlobalSequenceStateRegistry {
         int uncommittedAllocationCount() {
             return uncommittedAllocations.size();
         }
+
+        int latestPhysicalOffsetCount() {
+            return lastPhysicalBaseOffsetByPartition.size();
+        }
     }
 }
