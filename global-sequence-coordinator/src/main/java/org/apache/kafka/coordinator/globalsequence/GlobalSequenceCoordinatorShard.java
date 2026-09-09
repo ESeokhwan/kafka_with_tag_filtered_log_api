@@ -125,7 +125,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
 
             return new GlobalSequenceCoordinatorShard(
                     logContext,
-                    new GlobalSequenceStateRegistry(snapshotRegistry),
+                    new GlobalSequenceStateRegistry(snapshotRegistry, config.maxLookupIndexEntries()),
                     time,
                     timer,
                     config,

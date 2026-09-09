@@ -32,9 +32,18 @@ import java.util.Objects;
 public class GlobalSequenceStateRegistry {
     private final SnapshotRegistry snapshotRegistry;
     private final TimelineHashMap<Uuid, GlobalSequenceState> stateMap;
+    private final int maxLookupIndexEntries;
 
     public GlobalSequenceStateRegistry(SnapshotRegistry snapshotRegistry) {
+        this(snapshotRegistry, GlobalSequenceCoordinatorConfig.MAX_LOOKUP_INDEX_ENTRIES_DEFAULT);
+    }
+
+    public GlobalSequenceStateRegistry(SnapshotRegistry snapshotRegistry, int maxLookupIndexEntries) {
         this.snapshotRegistry = Objects.requireNonNull(snapshotRegistry, "snapshotRegistry");
+        if (maxLookupIndexEntries <= 0) {
+            throw new IllegalArgumentException("maxLookupIndexEntries must be positive");
+        }
+        this.maxLookupIndexEntries = maxLookupIndexEntries;
         this.stateMap = new TimelineHashMap<>(snapshotRegistry, 0);
     }
 
@@ -92,7 +101,11 @@ public class GlobalSequenceStateRegistry {
         if (state == null) {
             throw outOfRange(request, request.globalStartOffset());
         }
-        return state.lookup(request, indexLogHighWatermark);
+        return state.lookup(
+            request,
+            indexLogHighWatermark,
+            Math.min(request.maxIndexEntries(), maxLookupIndexEntries)
+        );
     }
 
     private static OffsetOutOfRangeException outOfRange(
@@ -229,7 +242,11 @@ public class GlobalSequenceStateRegistry {
             sequenceByPhysicalBatch.remove(physicalBatchId);
         }
 
-        GlobalSequenceLookupResult lookup(GlobalSequenceLookupRequest request, long indexLogHighWatermark) {
+        GlobalSequenceLookupResult lookup(
+            GlobalSequenceLookupRequest request,
+            long indexLogHighWatermark,
+            int maxIndexEntries
+        ) {
             List<GlobalSequenceIndexRecord> matches = new ArrayList<>();
             long nextOffsetToCover = request.globalStartOffset();
             long count = allocationCount.get(indexLogHighWatermark);
@@ -256,7 +273,8 @@ public class GlobalSequenceStateRegistry {
                     indexRecord.globalEndOffsetExclusive(),
                     request.globalEndOffsetExclusive()
                 );
-                if (nextOffsetToCover == request.globalEndOffsetExclusive()) {
+                if (nextOffsetToCover == request.globalEndOffsetExclusive() ||
+                    matches.size() == maxIndexEntries) {
                     return new GlobalSequenceLookupResult(matches);
                 }
             }

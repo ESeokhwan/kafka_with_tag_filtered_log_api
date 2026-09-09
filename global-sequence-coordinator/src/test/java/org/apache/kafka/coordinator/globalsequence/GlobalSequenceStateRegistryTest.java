@@ -386,6 +386,40 @@ class GlobalSequenceStateRegistryTest {
     }
 
     @Test
+    void testLookupAppliesRequestAndBrokerEntryLimits() {
+        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+        GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(snapshotRegistry, 2);
+        GlobalSequenceIndexRecord first = record(TOPIC_ID, 0L, 1, 0, 10L);
+        GlobalSequenceIndexRecord second = record(TOPIC_ID, 1L, 1, 1, 20L);
+        GlobalSequenceIndexRecord third = record(TOPIC_ID, 2L, 1, 2, 30L);
+        registry.replay(first);
+        registry.replay(second);
+        registry.replay(third);
+
+        assertEquals(
+            new GlobalSequenceLookupResult(List.of(first, second)),
+            registry.lookup(
+                new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 3L, 10),
+                SnapshotRegistry.LATEST_EPOCH
+            )
+        );
+        assertEquals(
+            new GlobalSequenceLookupResult(List.of(second)),
+            registry.lookup(
+                new GlobalSequenceLookupRequest(TOPIC_ID, 1L, 3L, 1),
+                SnapshotRegistry.LATEST_EPOCH
+            )
+        );
+        assertEquals(
+            new GlobalSequenceLookupResult(List.of(third)),
+            registry.lookup(
+                new GlobalSequenceLookupRequest(TOPIC_ID, 2L, 3L, 1),
+                SnapshotRegistry.LATEST_EPOCH
+            )
+        );
+    }
+
+    @Test
     void testLookupRejectsGapBetweenAllocations() {
         GlobalSequenceStateRegistry registry = newRegistry();
         GlobalSequenceIndexRecord first = record(TOPIC_ID, 0L, 2, 0, 10L);
