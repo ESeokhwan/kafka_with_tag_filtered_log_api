@@ -32,7 +32,11 @@ import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceIndex
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceIndexLogValue;
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceTopicMetadataKey;
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceTopicMetadataValue;
+import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.image.TopicImage;
+import org.apache.kafka.image.TopicsDelta;
+import org.apache.kafka.image.TopicsImage;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.timeline.SnapshotRegistry;
 
@@ -42,17 +46,20 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class GlobalSequenceCoordinatorShardTest {
     private static final Uuid TOPIC_ID = Uuid.randomUuid();
 
     private GlobalSequenceStateRegistry stateRegistry;
+    private GlobalSequenceIndexCache indexCache;
     private SnapshotRegistry snapshotRegistry;
     private MockCoordinatorTimer<Void, CoordinatorRecord> timer;
     private GlobalSequenceCoordinatorShard shard;
@@ -68,10 +75,11 @@ class GlobalSequenceCoordinatorShardTest {
         GlobalSequenceCoordinatorConfig config = new GlobalSequenceCoordinatorConfig(
             new AbstractConfig(GlobalSequenceCoordinatorConfig.CONFIG_DEF, Map.of())
         );
+        indexCache = new GlobalSequenceIndexCache(config.indexCacheMaxEntries());
         shard = new GlobalSequenceCoordinatorShard(
             logContext,
             stateRegistry,
-            new GlobalSequenceIndexCache(config.indexCacheMaxEntries()),
+            indexCache,
             time,
             timer,
             config,
@@ -286,7 +294,7 @@ class GlobalSequenceCoordinatorShardTest {
     void testOnLoadedBootstrapsMetadataForLegacyAllocationLog() {
         replay(coordinatorRecord(new GlobalSequenceIndexRecord(TOPIC_ID, 7L, 3, 2, 30L)));
 
-        shard.onLoaded(MetadataImage.EMPTY);
+        shard.onLoaded(metadataImage(TOPIC_ID));
 
         List<MockCoordinatorTimer.ExpiredTimeout<Void, CoordinatorRecord>> expired = timer.poll();
         assertEquals(1, expired.size());
@@ -362,7 +370,7 @@ class GlobalSequenceCoordinatorShardTest {
     void testTombstoneDoesNotInvalidateCommittedCacheBeforeHighWatermark() {
         GlobalSequenceIndexRecord existing = new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 3, 1, 20L);
         replay(coordinatorRecord(existing));
-        shard.onLoaded(MetadataImage.EMPTY);
+        shard.onLoaded(metadataImage(TOPIC_ID));
 
         shard.replay(
             1L,
@@ -384,7 +392,7 @@ class GlobalSequenceCoordinatorShardTest {
     void testRolledBackTombstoneDoesNotInvalidateCommittedCache() {
         GlobalSequenceIndexRecord existing = new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 3, 1, 20L);
         replay(coordinatorRecord(existing));
-        shard.onLoaded(MetadataImage.EMPTY);
+        shard.onLoaded(metadataImage(TOPIC_ID));
         shard.replay(
             1L,
             RecordBatch.NO_PRODUCER_ID,
@@ -416,6 +424,70 @@ class GlobalSequenceCoordinatorShardTest {
 
         assertEquals(0L, first.response().globalBaseOffset());
         assertEquals(0L, other.response().globalBaseOffset());
+    }
+
+    @Test
+    void testDeletedTopicClearsAllInMemoryState() {
+        Uuid otherTopicId = Uuid.randomUuid();
+        GlobalSequenceIndexRecord deletedTopicRecord = new GlobalSequenceIndexRecord(
+            TOPIC_ID,
+            0L,
+            1,
+            0,
+            10L
+        );
+        GlobalSequenceIndexRecord otherTopicRecord = new GlobalSequenceIndexRecord(
+            otherTopicId,
+            0L,
+            1,
+            0,
+            20L
+        );
+        replay(coordinatorRecord(deletedTopicRecord));
+        replay(coordinatorRecord(otherTopicRecord));
+        shard.onLoaded(metadataImage(TOPIC_ID, otherTopicId));
+        CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> uncommitted = shard.appendIndex(
+            request(TOPIC_ID, 0, 11L, 1)
+        );
+        replay(uncommitted.records().get(0));
+        assertEquals(1, stateRegistry.uncommittedAllocationCount());
+
+        MetadataDelta delta = mock(MetadataDelta.class);
+        TopicsDelta topicsDelta = mock(TopicsDelta.class);
+        when(delta.topicsDelta()).thenReturn(topicsDelta);
+        when(topicsDelta.deletedTopicIds()).thenReturn(Set.of(TOPIC_ID));
+        shard.onNewMetadataImage(MetadataImage.EMPTY, delta);
+
+        assertFalse(stateRegistry.contains(TOPIC_ID));
+        assertTrue(stateRegistry.contains(otherTopicId));
+        assertEquals(0, stateRegistry.uncommittedAllocationCount());
+        assertEquals(1, indexCache.size());
+        assertFalse(timer.contains(
+            GlobalSequenceCoordinatorShard.GLOBAL_SEQUENCE_METADATA_BOOTSTRAP_KEY_PREFIX + TOPIC_ID
+        ));
+        assertEquals(
+            new GlobalSequenceLookupResult(List.of(otherTopicRecord)),
+            shard.lookupIndex(new GlobalSequenceLookupRequest(otherTopicId, 0L, 1L), 2L)
+        );
+
+        Uuid replacementTopicId = Uuid.randomUuid();
+        assertEquals(
+            0L,
+            shard.appendIndex(request(replacementTopicId, 0, 0L, 1)).response().globalBaseOffset()
+        );
+    }
+
+    @Test
+    void testOnLoadedClearsStateForTopicsMissingFromMetadata() {
+        replay(coordinatorRecord(new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 1, 0, 10L)));
+
+        shard.onLoaded(MetadataImage.EMPTY);
+
+        assertFalse(stateRegistry.contains(TOPIC_ID));
+        assertEquals(0, indexCache.size());
+        assertFalse(timer.contains(
+            GlobalSequenceCoordinatorShard.GLOBAL_SEQUENCE_METADATA_BOOTSTRAP_KEY_PREFIX + TOPIC_ID
+        ));
     }
 
     @Test
@@ -599,5 +671,15 @@ class GlobalSequenceCoordinatorShardTest {
                 (short) 0
             )
         );
+    }
+
+    private static MetadataImage metadataImage(Uuid... topicIds) {
+        MetadataImage image = mock(MetadataImage.class);
+        TopicsImage topicsImage = mock(TopicsImage.class);
+        when(image.topics()).thenReturn(topicsImage);
+        for (Uuid topicId : topicIds) {
+            when(topicsImage.getTopic(topicId)).thenReturn(mock(TopicImage.class));
+        }
+        return image;
     }
 }

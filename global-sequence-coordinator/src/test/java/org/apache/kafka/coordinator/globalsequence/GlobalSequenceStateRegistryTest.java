@@ -263,6 +263,34 @@ class GlobalSequenceStateRegistryTest {
     }
 
     @Test
+    void testRemoveTopicClearsSequencePhysicalCheckpointsAndOverlay() {
+        GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(
+            new SnapshotRegistry(new LogContext()),
+            1,
+            2
+        );
+        registry.replay(record(TOPIC_ID, 0L, 2, 1, 20L), 9L, false);
+        registry.replay(record(TOPIC_ID, 2L, 1, 1, 21L), 10L);
+        registry.replay(record(OTHER_TOPIC_ID, 0L, 2, 0, 30L), 11L, false);
+
+        assertEquals(1, registry.removeTopic(TOPIC_ID));
+
+        assertFalse(registry.contains(TOPIC_ID));
+        assertTrue(registry.contains(OTHER_TOPIC_ID));
+        assertEquals(0, registry.checkpointCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));
+        assertEquals(
+            0,
+            registry.physicalCheckpointCount(TOPIC_ID, 1, SnapshotRegistry.LATEST_EPOCH)
+        );
+        assertFalse(registry.topicsMissingDurableMetadata().containsKey(TOPIC_ID));
+        assertEquals(
+            0L,
+            registry.prepareAppend(request(TOPIC_ID, 0, 0L, 1)).indexRecord().globalBaseOffset()
+        );
+        assertEquals(2L, registry.getState(OTHER_TOPIC_ID).nextGlobalOffset());
+    }
+
+    @Test
     void testReplayRejectsConflictsAndOverlaps() {
         GlobalSequenceStateRegistry registry = newRegistry();
         GlobalSequenceIndexRecord existing = record(TOPIC_ID, 5L, 5, 0, 10L);

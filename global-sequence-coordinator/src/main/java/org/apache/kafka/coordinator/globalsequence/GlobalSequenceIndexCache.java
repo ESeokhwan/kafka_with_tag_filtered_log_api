@@ -90,6 +90,19 @@ public class GlobalSequenceIndexCache {
         }
     }
 
+    public synchronized int removeTopic(Uuid topicId) {
+        Objects.requireNonNull(topicId, "topicId");
+        NavigableMap<Long, GlobalSequenceIndexRecord> removed = byTopic.remove(topicId);
+        if (removed == null) {
+            return 0;
+        }
+        removed.forEach((globalBaseOffset, indexRecord) -> {
+            lru.remove(new IndexKey(topicId, globalBaseOffset));
+            byPhysicalBatch.remove(physicalBatchId(indexRecord), indexRecord);
+        });
+        return removed.size();
+    }
+
     public synchronized Optional<GlobalSequenceIndexRecord> getByPhysicalBatch(PhysicalBatchId physicalBatchId) {
         Objects.requireNonNull(physicalBatchId, "physicalBatchId");
         GlobalSequenceIndexRecord record = byPhysicalBatch.get(physicalBatchId);

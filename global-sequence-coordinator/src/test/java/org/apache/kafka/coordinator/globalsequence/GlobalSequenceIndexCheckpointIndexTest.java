@@ -68,6 +68,19 @@ class GlobalSequenceIndexCheckpointIndexTest {
     }
 
     @Test
+    void testRemoveTopicLeavesOtherTopicCheckpoints() {
+        GlobalSequenceIndexCheckpointIndex index = newIndex();
+        Uuid otherTopicId = Uuid.randomUuid();
+        index.replayAllocation(TOPIC_ID, 0L, 10L);
+        index.replayAllocation(otherTopicId, 0L, 11L);
+
+        index.removeTopic(TOPIC_ID);
+
+        assertEquals(0, index.numCheckpoints(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));
+        assertEquals(1, index.numCheckpoints(otherTopicId, SnapshotRegistry.LATEST_EPOCH));
+    }
+
+    @Test
     void testCommittedCheckpointsAreNotRolledBackWithUncommittedState() {
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
         GlobalSequenceIndexCheckpointIndex index = new GlobalSequenceIndexCheckpointIndex(snapshotRegistry, 4, 2);

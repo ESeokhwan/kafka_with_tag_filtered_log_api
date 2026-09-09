@@ -85,6 +85,32 @@ class GlobalSequenceIndexCacheTest {
     }
 
     @Test
+    void testRemoveTopicInvalidatesGlobalAndPhysicalIndexes() {
+        GlobalSequenceIndexCache cache = new GlobalSequenceIndexCache(10);
+        Uuid otherTopicId = Uuid.randomUuid();
+        GlobalSequenceIndexRecord first = record(0L, 1, 0, 10L);
+        GlobalSequenceIndexRecord second = record(1L, 1, 1, 20L);
+        GlobalSequenceIndexRecord other = new GlobalSequenceIndexRecord(
+            otherTopicId,
+            0L,
+            1,
+            0,
+            10L
+        );
+        cache.put(first);
+        cache.put(second);
+        cache.put(other);
+
+        assertEquals(2, cache.removeTopic(TOPIC_ID));
+
+        assertEquals(1, cache.size());
+        assertFalse(cache.getByPhysicalBatch(physicalBatchId(first)).isPresent());
+        assertFalse(cache.getByPhysicalBatch(physicalBatchId(second)).isPresent());
+        assertTrue(cache.getByPhysicalBatch(physicalBatchId(other)).isPresent());
+        assertEquals(0, cache.removeTopic(TOPIC_ID));
+    }
+
+    @Test
     void testRejectsConflictingIndexes() {
         GlobalSequenceIndexCache cache = new GlobalSequenceIndexCache(2);
         cache.put(record(0L, 1, 0, 10L));

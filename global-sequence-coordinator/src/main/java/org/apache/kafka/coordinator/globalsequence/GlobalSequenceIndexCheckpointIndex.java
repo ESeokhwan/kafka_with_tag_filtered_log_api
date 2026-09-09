@@ -105,6 +105,11 @@ public class GlobalSequenceIndexCheckpointIndex {
         return topicCheckpoints == null ? 0 : topicCheckpoints.byOrdinal.size();
     }
 
+    public void removeTopic(Uuid topicId) {
+        validateTopicId(topicId);
+        checkpointsByTopic.remove(topicId);
+    }
+
     List<GlobalSequenceIndexCheckpoint> checkpoints(Uuid topicId, long epoch) {
         validateTopicId(topicId);
         TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId);

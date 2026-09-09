@@ -57,6 +57,25 @@ class GlobalSequencePhysicalCheckpointIndexTest {
         assertEquals(4, index.numCheckpoints(TOPIC_ID, 1, SnapshotRegistry.LATEST_EPOCH));
     }
 
+    @Test
+    void testRemoveTopicClearsEveryPhysicalPartition() {
+        GlobalSequencePhysicalCheckpointIndex index = new GlobalSequencePhysicalCheckpointIndex(
+            new SnapshotRegistry(new LogContext()),
+            1,
+            2
+        );
+        Uuid otherTopicId = Uuid.randomUuid();
+        index.replayAllocation(TOPIC_ID, 0, 10L, 100L);
+        index.replayAllocation(TOPIC_ID, 1, 20L, 101L);
+        index.replayAllocation(otherTopicId, 0, 10L, 102L);
+
+        index.removeTopic(TOPIC_ID);
+
+        assertEquals(0, index.numCheckpoints(TOPIC_ID, 0, SnapshotRegistry.LATEST_EPOCH));
+        assertEquals(0, index.numCheckpoints(TOPIC_ID, 1, SnapshotRegistry.LATEST_EPOCH));
+        assertEquals(1, index.numCheckpoints(otherTopicId, 0, SnapshotRegistry.LATEST_EPOCH));
+    }
+
     private static GlobalSequencePhysicalCheckpoint checkpoint(long ordinal) {
         return new GlobalSequencePhysicalCheckpoint(ordinal, ordinal * 10L, ordinal * 100L);
     }

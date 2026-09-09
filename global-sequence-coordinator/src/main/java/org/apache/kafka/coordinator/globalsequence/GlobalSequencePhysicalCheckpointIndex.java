@@ -99,6 +99,11 @@ public class GlobalSequencePhysicalCheckpointIndex {
         return partitionCheckpoints == null ? 0 : partitionCheckpoints.byOrdinal.size();
     }
 
+    public void removeTopic(Uuid topicId) {
+        Objects.requireNonNull(topicId, "topicId");
+        checkpointsByPartition.keySet().removeIf(partitionId -> partitionId.topicId().equals(topicId));
+    }
+
     List<GlobalSequencePhysicalCheckpoint> checkpoints(Uuid topicId, int partitionIndex, long epoch) {
         PartitionCheckpoints partitionCheckpoints = checkpointsByPartition.get(
             new PhysicalPartitionId(topicId, partitionIndex)

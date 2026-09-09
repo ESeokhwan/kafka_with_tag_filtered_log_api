@@ -39,6 +39,7 @@ import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceTopic
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceTopicMetadataValue;
 import org.apache.kafka.coordinator.globalsequence.metrics.GlobalSequenceCoordinatorMetrics;
 import org.apache.kafka.coordinator.globalsequence.metrics.GlobalSequenceCoordinatorMetricsShard;
+import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.timeline.SnapshotRegistry;
@@ -482,6 +483,9 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
             addRetainedAllocations(-cleared);
         }
         uncommittedTombstones.clear();
+        stateRegistry.topicIds().stream()
+            .filter(topicId -> newImage.topics().getTopic(topicId) == null)
+            .forEach(this::removeTopicState);
         loading = false;
         scheduleTopicMetadataBootstrap();
         coordinatorMetrics.activateMetricsShard(metricsShard);
@@ -500,6 +504,27 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
             addRetainedAllocations(-rolledBack);
         }
         uncommittedTombstones.removeIf(tombstone -> tombstone.indexLogOffset() >= offset);
+    }
+
+    @Override
+    public void onNewMetadataImage(MetadataImage newImage, MetadataDelta delta) {
+        if (delta.topicsDelta() == null) {
+            return;
+        }
+        delta.topicsDelta().deletedTopicIds().forEach(this::removeTopicState);
+    }
+
+    private void removeTopicState(Uuid topicId) {
+        int removedUncommittedAllocations = stateRegistry.removeTopic(topicId);
+        if (removedUncommittedAllocations > 0) {
+            addRetainedAllocations(-removedUncommittedAllocations);
+        }
+        indexCache.removeTopic(topicId);
+        uncommittedTombstones.removeIf(tombstone -> tombstone.topicId().equals(topicId));
+
+        String timerKey = GLOBAL_SEQUENCE_METADATA_BOOTSTRAP_KEY_PREFIX + topicId;
+        timer.cancel(timerKey);
+        metadataBootstrapTimerKeys.remove(timerKey);
     }
 
     @Override

@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 
 /**
  * The bounded replay-driven state owned by one global sequence coordinator shard.
@@ -73,6 +74,10 @@ public class GlobalSequenceStateRegistry {
 
     public boolean contains(Uuid topicId) {
         return stateMap.containsKey(topicId);
+    }
+
+    Set<Uuid> topicIds() {
+        return Set.copyOf(stateMap.keySet());
     }
 
     private void createNewTopicState(Uuid topicId) {
@@ -191,6 +196,14 @@ public class GlobalSequenceStateRegistry {
             cleared = Math.addExact(cleared, state.clearUncommittedAllocations());
         }
         return cleared;
+    }
+
+    int removeTopic(Uuid topicId) {
+        validateTopicId(topicId);
+        GlobalSequenceState removed = stateMap.remove(topicId);
+        checkpointIndex.removeTopic(topicId);
+        physicalCheckpointIndex.removeTopic(topicId);
+        return removed == null ? 0 : removed.uncommittedAllocationCount();
     }
 
     long scanStartIndexLogOffset(
