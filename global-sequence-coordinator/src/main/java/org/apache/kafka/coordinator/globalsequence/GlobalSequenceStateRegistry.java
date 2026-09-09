@@ -68,10 +68,10 @@ public class GlobalSequenceStateRegistry {
         return state.prepareAppend(request);
     }
 
-    void replay(GlobalSequenceIndexRecord indexRecord) {
+    boolean replay(GlobalSequenceIndexRecord indexRecord) {
         Objects.requireNonNull(indexRecord, "indexRecord");
         createNewTopicState(indexRecord.topicId());
-        stateMap.get(indexRecord.topicId()).replay(indexRecord);
+        return stateMap.get(indexRecord.topicId()).replay(indexRecord);
     }
 
     void replayTombstone(Uuid topicId, long globalBaseOffset) {
@@ -157,7 +157,7 @@ public class GlobalSequenceStateRegistry {
             ), false);
         }
 
-        void replay(GlobalSequenceIndexRecord indexRecord) {
+        boolean replay(GlobalSequenceIndexRecord indexRecord) {
             PhysicalBatchId physicalBatchId = new PhysicalBatchId(
                 indexRecord.topicId(),
                 indexRecord.partitionIndex(),
@@ -184,7 +184,7 @@ public class GlobalSequenceStateRegistry {
                 if (byPhysicalBatch == null || byGlobalBaseOffset == null) {
                     throw new IllegalStateException("Global sequence indexes are inconsistent for " + indexRecord);
                 }
-                return;
+                return false;
             }
 
             validateReplayOrder(indexRecord);
@@ -203,6 +203,7 @@ public class GlobalSequenceStateRegistry {
             sequenceByAllocationOrdinal.put(allocationOrdinal, indexRecord);
             offsetSequencer.replayAllocation(indexRecord.globalBaseOffset(), indexRecord.recordCount());
             allocationCount.set(nextAllocationCount);
+            return true;
         }
 
         void replayTombstone(long globalBaseOffset) {

@@ -188,7 +188,16 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     }
 
     GlobalSequenceLookupResult lookupIndex(GlobalSequenceLookupRequest request, long indexLogHighWatermark) {
-        return stateRegistry.lookup(request, indexLogHighWatermark);
+        GlobalSequenceLookupResult result = stateRegistry.lookup(request, indexLogHighWatermark);
+        metricsShard.record(
+            GlobalSequenceCoordinatorMetrics.INDEX_LOOKUP_ENTRIES_SENSOR_NAME,
+            result.indexRecords().size()
+        );
+        GlobalSequenceIndexRecord lastRecord = result.indexRecords().get(result.indexRecords().size() - 1);
+        if (lastRecord.globalEndOffsetExclusive() < request.globalEndOffsetExclusive()) {
+            metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_LOOKUP_PAGINATIONS_SENSOR_NAME);
+        }
+        return result;
     }
 
     private CoordinatorRecord toCoordinatorRecord(GlobalSequenceIndexRecord indexRecord) {
@@ -239,13 +248,19 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
             throw new IllegalStateException("Unexpected global sequence index record value " + value);
         }
 
-        stateRegistry.replay(new GlobalSequenceIndexRecord(
+        boolean added = stateRegistry.replay(new GlobalSequenceIndexRecord(
             indexKey.topicId(),
             indexKey.globalOffset(),
             indexValue.recordsCount(),
             indexValue.partitionIndex(),
             indexValue.partitionOffset()
         ));
+        if (added) {
+            if (metricsShard instanceof GlobalSequenceCoordinatorMetricsShard globalSequenceMetricsShard) {
+                globalSequenceMetricsShard.incrementRetainedAllocations();
+            }
+            metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_ALLOCATIONS_SENSOR_NAME);
+        }
     }
 
     @Override

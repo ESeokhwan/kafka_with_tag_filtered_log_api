@@ -20,24 +20,26 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorMetricsShard;
 import org.apache.kafka.timeline.SnapshotRegistry;
+import org.apache.kafka.timeline.TimelineLong;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class GlobalSequenceCoordinatorMetricsShard implements CoordinatorMetricsShard {
 
     private final Map<String, Sensor> globalSensors;
 
     private final TopicPartition topicPartition;
+    private final TimelineLong retainedAllocations;
+    private final AtomicLong committedRetainedAllocations = new AtomicLong(0L);
 
     public GlobalSequenceCoordinatorMetricsShard(
             SnapshotRegistry snapshotRegistry,
             Map<String, Sensor> globalSensors,
             TopicPartition topicPartition
     ) {
-        Objects.requireNonNull(snapshotRegistry);
-
-        // TODO: Implement here, referring to GroupCoordinatorMetricsShard.java
+        retainedAllocations = new TimelineLong(Objects.requireNonNull(snapshotRegistry));
 
         this.globalSensors = Objects.requireNonNull(globalSensors);
         this.topicPartition = Objects.requireNonNull(topicPartition);
@@ -45,22 +47,39 @@ public class GlobalSequenceCoordinatorMetricsShard implements CoordinatorMetrics
 
     @Override
     public void record(String sensorName) {
-        // TODO: Implement here, referring to GroupCoordinatorMetricsShard.java
+        Sensor sensor = globalSensors.get(sensorName);
+        if (sensor != null) {
+            sensor.record();
+        }
     }
 
     @Override
     public void record(String sensorName, double val) {
-        // TODO: Implement here, referring to GroupCoordinatorMetricsShard.java
+        Sensor sensor = globalSensors.get(sensorName);
+        if (sensor != null) {
+            sensor.record(val);
+        }
     }
 
     @Override
     public TopicPartition topicPartition() {
-        // TODO: Implement here, referring to GroupCoordinatorMetricsShard.java
-        return null;
+        return topicPartition;
     }
 
     @Override
     public void commitUpTo(long offset) {
-        // TODO: Implement here, referring to GroupCoordinatorMetricsShard.java
+        synchronized (retainedAllocations) {
+            committedRetainedAllocations.set(retainedAllocations.get(offset));
+        }
+    }
+
+    public void incrementRetainedAllocations() {
+        synchronized (retainedAllocations) {
+            retainedAllocations.increment();
+        }
+    }
+
+    public long numRetainedAllocations() {
+        return committedRetainedAllocations.get();
     }
 }
