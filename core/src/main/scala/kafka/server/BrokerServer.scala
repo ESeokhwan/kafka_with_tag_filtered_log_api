@@ -754,7 +754,9 @@ class BrokerServer(
       ),
       time,
       config.requestTimeoutMs,
-      GlobalSequenceIndexRoutingManager.DEFAULT_RETRY_BACKOFF_MS
+      GlobalSequenceIndexRoutingManager.DEFAULT_RETRY_BACKOFF_MS,
+      config.globalSequenceCoordinatorConfig.maxConcurrentPhysicalFetches(),
+      metrics
     )
   }
 

@@ -69,6 +69,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -366,6 +367,88 @@ class GlobalSequenceIndexRoutingManagerTest {
         assertEquals(4, fetched.batches().get(0).lastRecordIndexExclusive());
         assertEquals(7L, fetched.batches().get(0).abortedTransactions().get(0).producerId());
         assertEquals(4L, fetched.nextGlobalOffset());
+    }
+
+    @Test
+    void testLimitsConcurrentPhysicalFetches() {
+        manager = new GlobalSequenceIndexRoutingManager(
+            LOCAL_BROKER_ID,
+            coordinator,
+            dataReader,
+            metadataCache,
+            autoTopicCreationManager,
+            LISTENER_NAME,
+            networkClient,
+            time,
+            Math.toIntExact(REQUEST_TIMEOUT_MS),
+            RETRY_BACKOFF_MS,
+            2
+        );
+        Node localLeader = new Node(LOCAL_BROKER_ID, "localhost", 9092);
+        when(metadataCache.getPartitionLeaderEndpoint(
+            Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME,
+            INDEX_PARTITION,
+            LISTENER_NAME
+        )).thenReturn(Optional.of(localLeader));
+        when(metadataCache.getTopicName(TOPIC_ID)).thenReturn(Optional.of("data-topic"));
+        when(metadataCache.getPartitionLeaderEndpoint("data-topic", 0, LISTENER_NAME))
+            .thenReturn(Optional.of(localLeader));
+
+        List<GlobalSequenceIndexRecord> indexes = List.of(
+            new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 1, 0, 10L),
+            new GlobalSequenceIndexRecord(TOPIC_ID, 1L, 1, 0, 11L),
+            new GlobalSequenceIndexRecord(TOPIC_ID, 2L, 1, 0, 12L),
+            new GlobalSequenceIndexRecord(TOPIC_ID, 3L, 1, 0, 13L),
+            new GlobalSequenceIndexRecord(TOPIC_ID, 4L, 1, 0, 14L)
+        );
+        when(coordinator.lookupIndex(new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 5L)))
+            .thenReturn(CompletableFuture.completedFuture(new GlobalSequenceLookupResult(indexes)));
+
+        List<CompletableFuture<GlobalSequencePhysicalFetchResult>> physicalResults = List.of(
+            new CompletableFuture<>(),
+            new CompletableFuture<>(),
+            new CompletableFuture<>(),
+            new CompletableFuture<>(),
+            new CompletableFuture<>()
+        );
+        for (int index = 0; index < indexes.size(); index++) {
+            GlobalSequenceIndexRecord indexRecord = indexes.get(index);
+            when(dataReader.fetch(new GlobalSequencePhysicalFetchRequest(
+                TOPIC_ID,
+                0,
+                indexRecord.partitionBaseOffset(),
+                1,
+                1024,
+                IsolationLevel.READ_UNCOMMITTED
+            ))).thenReturn(physicalResults.get(index));
+        }
+
+        CompletableFuture<GlobalSequenceFetchResult> result = manager.fetch(new GlobalSequenceFetchRequest(
+            TOPIC_ID,
+            0L,
+            5L,
+            1024,
+            IsolationLevel.READ_UNCOMMITTED
+        ));
+        assertTrue(manager.generateRequestsForTest().isEmpty());
+        assertTrue(manager.generateRequestsForTest().isEmpty());
+        verify(dataReader, times(2)).fetch(org.mockito.ArgumentMatchers.any());
+
+        physicalResults.get(0).complete(new GlobalSequencePhysicalFetchResult(records(10L, "a"), List.of()));
+        verify(dataReader, times(2)).fetch(org.mockito.ArgumentMatchers.any());
+        physicalResults.get(1).complete(new GlobalSequencePhysicalFetchResult(records(11L, "b"), List.of()));
+
+        assertTrue(manager.generateRequestsForTest().isEmpty());
+        verify(dataReader, times(4)).fetch(org.mockito.ArgumentMatchers.any());
+        physicalResults.get(2).complete(new GlobalSequencePhysicalFetchResult(records(12L, "c"), List.of()));
+        physicalResults.get(3).complete(new GlobalSequencePhysicalFetchResult(records(13L, "d"), List.of()));
+
+        assertTrue(manager.generateRequestsForTest().isEmpty());
+        verify(dataReader, times(5)).fetch(org.mockito.ArgumentMatchers.any());
+        physicalResults.get(4).complete(new GlobalSequencePhysicalFetchResult(records(14L, "e"), List.of()));
+
+        assertEquals(5, result.join().batches().size());
+        assertEquals(5L, result.join().nextGlobalOffset());
     }
 
     @Test

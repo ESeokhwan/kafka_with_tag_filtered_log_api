@@ -29,6 +29,7 @@ import org.apache.kafka.common.message.ReadGlobalSequenceDataRequestData;
 import org.apache.kafka.common.message.ReadGlobalSequenceDataResponseData;
 import org.apache.kafka.common.message.WriteGlobalSequenceIndexRequestData;
 import org.apache.kafka.common.message.WriteGlobalSequenceIndexResponseData;
+import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.MemoryRecords;
@@ -42,6 +43,7 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceAppendRequest;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceAppendResult;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinator;
+import org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinatorConfig;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceAbortedTransaction;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceFetchBatch;
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceFetchRequest;
@@ -91,6 +93,8 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
     private final Time time;
     private final int requestTimeoutMs;
     private final long retryBackoffMs;
+    private final int maxConcurrentPhysicalFetches;
+    private final GlobalSequenceRoutingMetrics routingMetrics;
     private final ConcurrentLinkedQueue<PendingOperation<?>> queue = new ConcurrentLinkedQueue<>();
     private final Set<PendingOperation<?>> pendingOperations = ConcurrentHashMap.newKeySet();
     private final SendThread sender;
@@ -111,6 +115,68 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
         int requestTimeoutMs,
         long retryBackoffMs
     ) {
+        this(
+            brokerId,
+            coordinator,
+            dataReader,
+            metadataCache,
+            autoTopicCreationManager,
+            interBrokerListenerName,
+            networkClient,
+            time,
+            requestTimeoutMs,
+            retryBackoffMs,
+            GlobalSequenceCoordinatorConfig.MAX_CONCURRENT_PHYSICAL_FETCHES_DEFAULT,
+            null
+        );
+    }
+
+    public GlobalSequenceIndexRoutingManager(
+        int brokerId,
+        GlobalSequenceCoordinator coordinator,
+        GlobalSequenceDataReader dataReader,
+        MetadataCache metadataCache,
+        AutoTopicCreationManager autoTopicCreationManager,
+        ListenerName interBrokerListenerName,
+        KafkaClient networkClient,
+        Time time,
+        int requestTimeoutMs,
+        long retryBackoffMs,
+        int maxConcurrentPhysicalFetches
+    ) {
+        this(
+            brokerId,
+            coordinator,
+            dataReader,
+            metadataCache,
+            autoTopicCreationManager,
+            interBrokerListenerName,
+            networkClient,
+            time,
+            requestTimeoutMs,
+            retryBackoffMs,
+            maxConcurrentPhysicalFetches,
+            null
+        );
+    }
+
+    public GlobalSequenceIndexRoutingManager(
+        int brokerId,
+        GlobalSequenceCoordinator coordinator,
+        GlobalSequenceDataReader dataReader,
+        MetadataCache metadataCache,
+        AutoTopicCreationManager autoTopicCreationManager,
+        ListenerName interBrokerListenerName,
+        KafkaClient networkClient,
+        Time time,
+        int requestTimeoutMs,
+        long retryBackoffMs,
+        int maxConcurrentPhysicalFetches,
+        Metrics metrics
+    ) {
+        if (maxConcurrentPhysicalFetches <= 0) {
+            throw new IllegalArgumentException("maxConcurrentPhysicalFetches must be positive");
+        }
         this.brokerId = brokerId;
         this.coordinator = coordinator;
         this.dataReader = dataReader;
@@ -120,6 +186,8 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
         this.time = time;
         this.requestTimeoutMs = requestTimeoutMs;
         this.retryBackoffMs = retryBackoffMs;
+        this.maxConcurrentPhysicalFetches = maxConcurrentPhysicalFetches;
+        this.routingMetrics = metrics == null ? null : new GlobalSequenceRoutingMetrics(metrics);
         this.sender = new SendThread(networkClient);
     }
 
@@ -192,22 +260,12 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
         GlobalSequenceLookupRequest lookupRequest = new GlobalSequenceLookupRequest(
             request.topicId(),
             request.globalStartOffset(),
-            request.globalEndOffsetExclusive()
+            request.globalEndOffsetExclusive(),
+            request.maxIndexEntries()
         );
-        return lookup(lookupRequest).thenCompose(lookupResult -> {
-            List<CompletableFuture<GlobalSequencePhysicalFetchResult>> fetches = lookupResult.indexRecords().stream()
-                .map(indexRecord -> fetchPhysical(new GlobalSequencePhysicalFetchRequest(
-                    request.topicId(),
-                    indexRecord.partitionIndex(),
-                    indexRecord.partitionBaseOffset(),
-                    indexRecord.recordCount(),
-                    request.maxBytes(),
-                    request.isolationLevel()
-                )))
-                .toList();
-            return CompletableFuture.allOf(fetches.toArray(new CompletableFuture<?>[0]))
-                .thenApply(ignored -> buildFetchResult(request, lookupResult.indexRecords(), fetches));
-        });
+        return lookup(lookupRequest).thenCompose(lookupResult ->
+            fetchPhysicalBatches(request, lookupResult.indexRecords())
+        );
     }
 
     public CompletableFuture<GlobalSequencePhysicalFetchResult> readPhysicalLocally(
@@ -231,6 +289,14 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
         );
         pendingOperations.add(pending);
         queue.add(pending);
+        if (routingMetrics != null) {
+            routingMetrics.recordPhysicalFetchStarted();
+        }
+        pending.result.whenComplete((result, exception) -> {
+            if (routingMetrics != null) {
+                routingMetrics.recordPhysicalFetchCompleted(time.milliseconds() - createdTimeMs);
+            }
+        });
 
         if (closed.get()) {
             queue.remove(pending);
@@ -241,45 +307,53 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
         return pending.result;
     }
 
-    private static GlobalSequenceFetchResult buildFetchResult(
+    private CompletableFuture<GlobalSequenceFetchResult> fetchPhysicalBatches(
+        GlobalSequenceFetchRequest request,
+        List<GlobalSequenceIndexRecord> indexRecords
+    ) {
+        if (indexRecords.isEmpty()) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                "Global sequence index lookup returned no entries for a non-empty range."
+            ));
+        }
+        return fetchPhysicalWindow(request, indexRecords, 0, new FetchAccumulator(request));
+    }
+
+    private CompletableFuture<GlobalSequenceFetchResult> fetchPhysicalWindow(
         GlobalSequenceFetchRequest request,
         List<GlobalSequenceIndexRecord> indexRecords,
-        List<CompletableFuture<GlobalSequencePhysicalFetchResult>> fetches
+        int windowStart,
+        FetchAccumulator accumulator
     ) {
-        List<GlobalSequenceFetchBatch> batches = new ArrayList<>();
-        int remainingBytes = request.maxBytes();
-        long nextGlobalOffset = request.globalStartOffset();
+        if (windowStart >= indexRecords.size() || !accumulator.shouldContinue()) {
+            return CompletableFuture.completedFuture(accumulator.result());
+        }
 
-        for (int index = 0; index < indexRecords.size(); index++) {
+        int windowEnd = Math.min(indexRecords.size(), windowStart + maxConcurrentPhysicalFetches);
+        List<CompletableFuture<GlobalSequencePhysicalFetchResult>> fetches = new ArrayList<>(
+            windowEnd - windowStart
+        );
+        for (int index = windowStart; index < windowEnd; index++) {
             GlobalSequenceIndexRecord indexRecord = indexRecords.get(index);
-            GlobalSequencePhysicalFetchResult physical = fetches.get(index).join();
-            int batchSize = physical.records().sizeInBytes();
-            if (!batches.isEmpty() && batchSize > remainingBytes) {
-                break;
-            }
-
-            int firstRecordIndex = Math.toIntExact(Math.max(
-                0L,
-                request.globalStartOffset() - indexRecord.globalBaseOffset()
-            ));
-            int lastRecordIndexExclusive = Math.toIntExact(Math.min(
-                indexRecord.recordCount(),
-                request.globalEndOffsetExclusive() - indexRecord.globalBaseOffset()
-            ));
-            batches.add(new GlobalSequenceFetchBatch(
-                indexRecord.globalBaseOffset(),
-                indexRecord.recordCount(),
-                firstRecordIndex,
-                lastRecordIndexExclusive,
+            fetches.add(fetchPhysical(new GlobalSequencePhysicalFetchRequest(
+                request.topicId(),
                 indexRecord.partitionIndex(),
                 indexRecord.partitionBaseOffset(),
-                physical.records(),
-                physical.abortedTransactions()
-            ));
-            remainingBytes = Math.max(0, remainingBytes - batchSize);
-            nextGlobalOffset = Math.addExact(indexRecord.globalBaseOffset(), lastRecordIndexExclusive);
+                indexRecord.recordCount(),
+                request.maxBytes(),
+                request.isolationLevel()
+            )));
         }
-        return new GlobalSequenceFetchResult(batches, nextGlobalOffset);
+
+        return CompletableFuture.allOf(fetches.toArray(new CompletableFuture<?>[0]))
+            .thenCompose(ignored -> {
+                for (int index = windowStart; index < windowEnd; index++) {
+                    if (!accumulator.add(indexRecords.get(index), fetches.get(index - windowStart).join())) {
+                        return CompletableFuture.completedFuture(accumulator.result());
+                    }
+                }
+                return fetchPhysicalWindow(request, indexRecords, windowEnd, accumulator);
+            });
     }
 
     private Collection<RequestAndCompletionHandler> generateRequests() {
@@ -693,6 +767,9 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
         if (needShutdownSender) {
             sender.shutdown();
         }
+        if (routingMetrics != null) {
+            routingMetrics.close();
+        }
     }
 
     private abstract static class PendingOperation<T> {
@@ -753,6 +830,60 @@ public class GlobalSequenceIndexRoutingManager implements AutoCloseable {
         @Override
         Uuid topicId() {
             return request.topicId();
+        }
+    }
+
+    private static final class FetchAccumulator {
+        private final GlobalSequenceFetchRequest request;
+        private final List<GlobalSequenceFetchBatch> batches = new ArrayList<>();
+        private int remainingBytes;
+        private long nextGlobalOffset;
+
+        private FetchAccumulator(GlobalSequenceFetchRequest request) {
+            this.request = request;
+            this.remainingBytes = request.maxBytes();
+            this.nextGlobalOffset = request.globalStartOffset();
+        }
+
+        private boolean add(
+            GlobalSequenceIndexRecord indexRecord,
+            GlobalSequencePhysicalFetchResult physical
+        ) {
+            int batchSize = physical.records().sizeInBytes();
+            if (!batches.isEmpty() && batchSize > remainingBytes) {
+                return false;
+            }
+
+            int firstRecordIndex = Math.toIntExact(Math.max(
+                0L,
+                request.globalStartOffset() - indexRecord.globalBaseOffset()
+            ));
+            int lastRecordIndexExclusive = Math.toIntExact(Math.min(
+                indexRecord.recordCount(),
+                request.globalEndOffsetExclusive() - indexRecord.globalBaseOffset()
+            ));
+            batches.add(new GlobalSequenceFetchBatch(
+                indexRecord.globalBaseOffset(),
+                indexRecord.recordCount(),
+                firstRecordIndex,
+                lastRecordIndexExclusive,
+                indexRecord.partitionIndex(),
+                indexRecord.partitionBaseOffset(),
+                physical.records(),
+                physical.abortedTransactions()
+            ));
+            remainingBytes = Math.max(0, remainingBytes - batchSize);
+            nextGlobalOffset = Math.addExact(indexRecord.globalBaseOffset(), lastRecordIndexExclusive);
+            return shouldContinue();
+        }
+
+        private boolean shouldContinue() {
+            return nextGlobalOffset < request.globalEndOffsetExclusive() &&
+                (batches.isEmpty() || remainingBytes > 0);
+        }
+
+        private GlobalSequenceFetchResult result() {
+            return new GlobalSequenceFetchResult(batches, nextGlobalOffset);
         }
     }
 

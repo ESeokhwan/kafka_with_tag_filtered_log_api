@@ -30,7 +30,7 @@ import org.apache.kafka.common.requests.{FetchGlobalSequenceRequest, FetchGlobal
 import org.apache.kafka.common.test.api.{ClusterConfigProperty, ClusterTest, Type}
 import org.apache.kafka.common.test.{ClusterInstance, TestUtils}
 import org.apache.kafka.coordinator.globalsequence.GlobalSequenceCoordinatorConfig
-import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue}
 
 import java.nio.charset.StandardCharsets
 import java.util
@@ -181,6 +181,7 @@ class GlobalSequenceRoutingIntegrationTest {
         .setTopicId(dataTopicId)
         .setGlobalStartOffset(0L)
         .setGlobalEndOffsetExclusive(2L)
+        .setMaxIndexEntries(1)
     ).build()
     val lookupResponse = connectAndReceive[LookupGlobalSequenceIndexResponse](
       lookupRequest,
@@ -189,13 +190,31 @@ class GlobalSequenceRoutingIntegrationTest {
     )
 
     assertEquals(Errors.NONE.code, lookupResponse.data.errorCode)
-    assertEquals(2, lookupResponse.data.indexEntries.size)
+    assertEquals(1, lookupResponse.data.indexEntries.size)
+    assertEquals(1L, lookupResponse.data.nextGlobalOffset)
+    assertTrue(lookupResponse.data.hasMore)
     assertEquals(0L, lookupResponse.data.indexEntries.get(0).globalBaseOffset)
     assertEquals(1, lookupResponse.data.indexEntries.get(0).recordCount)
     assertEquals(dataPartition, lookupResponse.data.indexEntries.get(0).physicalPartition)
     assertEquals(0L, lookupResponse.data.indexEntries.get(0).physicalBaseOffset)
-    assertEquals(1L, lookupResponse.data.indexEntries.get(1).globalBaseOffset)
-    assertEquals(1L, lookupResponse.data.indexEntries.get(1).physicalBaseOffset)
+
+    val nextLookupResponse = connectAndReceive[LookupGlobalSequenceIndexResponse](
+      new LookupGlobalSequenceIndexRequest.Builder(
+        new LookupGlobalSequenceIndexRequestData()
+          .setTopicId(dataTopicId)
+          .setGlobalStartOffset(lookupResponse.data.nextGlobalOffset)
+          .setGlobalEndOffsetExclusive(2L)
+          .setMaxIndexEntries(1)
+      ).build(),
+      cluster.brokers().get(dataLeaderId).socketServer,
+      cluster.clientListener()
+    )
+    assertEquals(Errors.NONE.code, nextLookupResponse.data.errorCode)
+    assertEquals(1, nextLookupResponse.data.indexEntries.size)
+    assertEquals(1L, nextLookupResponse.data.indexEntries.get(0).globalBaseOffset)
+    assertEquals(1L, nextLookupResponse.data.indexEntries.get(0).physicalBaseOffset)
+    assertEquals(2L, nextLookupResponse.data.nextGlobalOffset)
+    assertFalse(nextLookupResponse.data.hasMore)
 
     val fetchRequest = new FetchGlobalSequenceRequest.Builder(
       new FetchGlobalSequenceRequestData()
@@ -203,6 +222,7 @@ class GlobalSequenceRoutingIntegrationTest {
         .setGlobalStartOffset(0L)
         .setGlobalEndOffsetExclusive(2L)
         .setMaxBytes(1024 * 1024)
+        .setMaxIndexEntries(1)
     ).build()
     val fetchResponse = connectAndReceive[FetchGlobalSequenceResponse](
       fetchRequest,
@@ -211,14 +231,30 @@ class GlobalSequenceRoutingIntegrationTest {
     )
 
     assertEquals(Errors.NONE.code, fetchResponse.data.errorCode)
-    assertEquals(2L, fetchResponse.data.nextGlobalOffset)
-    assertEquals(2, fetchResponse.data.batches.size)
+    assertEquals(1L, fetchResponse.data.nextGlobalOffset)
+    assertEquals(1, fetchResponse.data.batches.size)
     assertEquals(0L, fetchResponse.data.batches.get(0).globalBaseOffset)
     assertEquals(0, fetchResponse.data.batches.get(0).firstRecordIndex)
     assertEquals(1, fetchResponse.data.batches.get(0).lastRecordIndexExclusive)
     assertEquals("first", firstValue(fetchResponse.data.batches.get(0).records.asInstanceOf[Records]))
-    assertEquals(1L, fetchResponse.data.batches.get(1).globalBaseOffset)
-    assertEquals("second", firstValue(fetchResponse.data.batches.get(1).records.asInstanceOf[Records]))
+
+    val nextFetchResponse = connectAndReceive[FetchGlobalSequenceResponse](
+      new FetchGlobalSequenceRequest.Builder(
+        new FetchGlobalSequenceRequestData()
+          .setTopicId(dataTopicId)
+          .setGlobalStartOffset(fetchResponse.data.nextGlobalOffset)
+          .setGlobalEndOffsetExclusive(2L)
+          .setMaxBytes(1024 * 1024)
+          .setMaxIndexEntries(1)
+      ).build(),
+      cluster.brokers().get(indexLeaderId).socketServer,
+      cluster.clientListener()
+    )
+    assertEquals(Errors.NONE.code, nextFetchResponse.data.errorCode)
+    assertEquals(2L, nextFetchResponse.data.nextGlobalOffset)
+    assertEquals(1, nextFetchResponse.data.batches.size)
+    assertEquals(1L, nextFetchResponse.data.batches.get(0).globalBaseOffset)
+    assertEquals("second", firstValue(nextFetchResponse.data.batches.get(0).records.asInstanceOf[Records]))
   }
 
   private def firstValue(records: Records): String = {

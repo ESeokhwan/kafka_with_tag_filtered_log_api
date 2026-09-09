@@ -53,6 +53,12 @@ public class GlobalSequenceCoordinatorConfig {
     public static final String MAX_LOOKUP_INDEX_ENTRIES_DOC = "The maximum number of index entries returned by one " +
         "global sequence lookup. Requests asking for more entries are capped at this value.";
 
+    public static final String MAX_CONCURRENT_PHYSICAL_FETCHES_CONFIG =
+        "global.sequence.fetch.max.concurrent.physical.requests";
+    public static final int MAX_CONCURRENT_PHYSICAL_FETCHES_DEFAULT = 8;
+    public static final String MAX_CONCURRENT_PHYSICAL_FETCHES_DOC = "The maximum number of physical data reads " +
+        "issued concurrently by one global sequence fetch.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(COMMIT_TIMEOUT_MS_CONFIG, INT, COMMIT_TIMEOUT_MS_DEFAULT, atLeast(1), HIGH, COMMIT_TIMEOUT_MS_DOC)
             .define(NUM_INDEX_PARTITIONS_CONFIG, INT, NUM_INDEX_PARTITIONS_DEFAULT, atLeast(1), HIGH, NUM_INDEX_PARTITIONS_DOC)
@@ -63,7 +69,9 @@ public class GlobalSequenceCoordinatorConfig {
             .define(INDEX_TOPIC_SEGMENT_BYTES_CONFIG, INT, INDEX_TOPIC_SEGMENT_BYTES_DEFAULT,
                     atLeast(1), HIGH, INDEX_TOPIC_SEGMENT_BYTES_DOC)
             .define(MAX_LOOKUP_INDEX_ENTRIES_CONFIG, INT, MAX_LOOKUP_INDEX_ENTRIES_DEFAULT,
-                    atLeast(1), HIGH, MAX_LOOKUP_INDEX_ENTRIES_DOC);
+                    atLeast(1), HIGH, MAX_LOOKUP_INDEX_ENTRIES_DOC)
+            .define(MAX_CONCURRENT_PHYSICAL_FETCHES_CONFIG, INT, MAX_CONCURRENT_PHYSICAL_FETCHES_DEFAULT,
+                    atLeast(1), HIGH, MAX_CONCURRENT_PHYSICAL_FETCHES_DOC);
 
     private final int commitTimeoutMs;
     private final int numIndexPartitions;
@@ -71,6 +79,7 @@ public class GlobalSequenceCoordinatorConfig {
     private final short indexTopicMinIsr;
     private final int indexTopicSegmentBytes;
     private final int maxLookupIndexEntries;
+    private final int maxConcurrentPhysicalFetches;
 
     public GlobalSequenceCoordinatorConfig(AbstractConfig config) {
         this.commitTimeoutMs = config.getInt(COMMIT_TIMEOUT_MS_CONFIG);
@@ -79,6 +88,7 @@ public class GlobalSequenceCoordinatorConfig {
         this.indexTopicMinIsr = config.getShort(INDEX_TOPIC_MIN_ISR_CONFIG);
         this.indexTopicSegmentBytes = config.getInt(INDEX_TOPIC_SEGMENT_BYTES_CONFIG);
         this.maxLookupIndexEntries = config.getInt(MAX_LOOKUP_INDEX_ENTRIES_CONFIG);
+        this.maxConcurrentPhysicalFetches = config.getInt(MAX_CONCURRENT_PHYSICAL_FETCHES_CONFIG);
     }
 
     public int commitTimeoutMs() {
@@ -105,4 +115,7 @@ public class GlobalSequenceCoordinatorConfig {
         return maxLookupIndexEntries;
     }
 
+    public int maxConcurrentPhysicalFetches() {
+        return maxConcurrentPhysicalFetches;
+    }
 }
