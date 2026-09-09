@@ -64,6 +64,16 @@ public class GlobalSequenceCoordinatorConfig {
     public static final String INDEX_LOG_READ_MAX_BYTES_DOC = "The maximum bytes read from a global sequence " +
         "index partition in one lazy lookup I/O operation.";
 
+    public static final String INDEX_CHECKPOINT_INTERVAL_CONFIG = "global.sequence.index.checkpoint.interval";
+    public static final int INDEX_CHECKPOINT_INTERVAL_DEFAULT = 1024;
+    public static final String INDEX_CHECKPOINT_INTERVAL_DOC = "The number of topic allocations between " +
+        "checkpoints in the newest sparse index level.";
+
+    public static final String INDEX_CHECKPOINT_LEVEL_FACTOR_CONFIG = "global.sequence.index.checkpoint.level.factor";
+    public static final int INDEX_CHECKPOINT_LEVEL_FACTOR_DEFAULT = 16;
+    public static final String INDEX_CHECKPOINT_LEVEL_FACTOR_DOC = "The geometric spacing and width factor used " +
+        "to retain progressively sparser checkpoints for older index ranges.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(COMMIT_TIMEOUT_MS_CONFIG, INT, COMMIT_TIMEOUT_MS_DEFAULT, atLeast(1), HIGH, COMMIT_TIMEOUT_MS_DOC)
             .define(NUM_INDEX_PARTITIONS_CONFIG, INT, NUM_INDEX_PARTITIONS_DEFAULT, atLeast(1), HIGH, NUM_INDEX_PARTITIONS_DOC)
@@ -78,7 +88,11 @@ public class GlobalSequenceCoordinatorConfig {
             .define(MAX_CONCURRENT_PHYSICAL_FETCHES_CONFIG, INT, MAX_CONCURRENT_PHYSICAL_FETCHES_DEFAULT,
                     atLeast(1), HIGH, MAX_CONCURRENT_PHYSICAL_FETCHES_DOC)
             .define(INDEX_LOG_READ_MAX_BYTES_CONFIG, INT, INDEX_LOG_READ_MAX_BYTES_DEFAULT,
-                    atLeast(1), HIGH, INDEX_LOG_READ_MAX_BYTES_DOC);
+                    atLeast(1), HIGH, INDEX_LOG_READ_MAX_BYTES_DOC)
+            .define(INDEX_CHECKPOINT_INTERVAL_CONFIG, INT, INDEX_CHECKPOINT_INTERVAL_DEFAULT,
+                    atLeast(1), HIGH, INDEX_CHECKPOINT_INTERVAL_DOC)
+            .define(INDEX_CHECKPOINT_LEVEL_FACTOR_CONFIG, INT, INDEX_CHECKPOINT_LEVEL_FACTOR_DEFAULT,
+                    atLeast(2), HIGH, INDEX_CHECKPOINT_LEVEL_FACTOR_DOC);
 
     private final int commitTimeoutMs;
     private final int numIndexPartitions;
@@ -88,6 +102,8 @@ public class GlobalSequenceCoordinatorConfig {
     private final int maxLookupIndexEntries;
     private final int maxConcurrentPhysicalFetches;
     private final int indexLogReadMaxBytes;
+    private final int indexCheckpointInterval;
+    private final int indexCheckpointLevelFactor;
 
     public GlobalSequenceCoordinatorConfig(AbstractConfig config) {
         this.commitTimeoutMs = config.getInt(COMMIT_TIMEOUT_MS_CONFIG);
@@ -98,6 +114,8 @@ public class GlobalSequenceCoordinatorConfig {
         this.maxLookupIndexEntries = config.getInt(MAX_LOOKUP_INDEX_ENTRIES_CONFIG);
         this.maxConcurrentPhysicalFetches = config.getInt(MAX_CONCURRENT_PHYSICAL_FETCHES_CONFIG);
         this.indexLogReadMaxBytes = config.getInt(INDEX_LOG_READ_MAX_BYTES_CONFIG);
+        this.indexCheckpointInterval = config.getInt(INDEX_CHECKPOINT_INTERVAL_CONFIG);
+        this.indexCheckpointLevelFactor = config.getInt(INDEX_CHECKPOINT_LEVEL_FACTOR_CONFIG);
     }
 
     public int commitTimeoutMs() {
@@ -130,5 +148,13 @@ public class GlobalSequenceCoordinatorConfig {
 
     public int indexLogReadMaxBytes() {
         return indexLogReadMaxBytes;
+    }
+
+    public int indexCheckpointInterval() {
+        return indexCheckpointInterval;
+    }
+
+    public int indexCheckpointLevelFactor() {
+        return indexCheckpointLevelFactor;
     }
 }
