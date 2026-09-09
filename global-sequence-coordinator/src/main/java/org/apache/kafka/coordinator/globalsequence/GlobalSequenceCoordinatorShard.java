@@ -35,6 +35,8 @@ import org.apache.kafka.coordinator.common.runtime.CoordinatorTimer;
 import org.apache.kafka.coordinator.globalsequence.generated.CoordinatorRecordType;
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceIndexLogKey;
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceIndexLogValue;
+import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceTopicMetadataKey;
+import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceTopicMetadataValue;
 import org.apache.kafka.coordinator.globalsequence.metrics.GlobalSequenceCoordinatorMetrics;
 import org.apache.kafka.coordinator.globalsequence.metrics.GlobalSequenceCoordinatorMetricsShard;
 import org.apache.kafka.image.MetadataImage;
@@ -44,8 +46,11 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 import org.slf4j.Logger;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 public class GlobalSequenceCoordinatorShard implements CoordinatorShard<CoordinatorRecord> {
 
@@ -145,6 +150,8 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     }
 
     static final String GLOBAL_SEQUENCE_EXPIRATION_KEY = "expire-global-sequence-metadata";
+    static final String GLOBAL_SEQUENCE_METADATA_BOOTSTRAP_KEY_PREFIX =
+        "bootstrap-global-sequence-topic-metadata-";
 
     private final Logger log;
 
@@ -163,6 +170,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     private final CoordinatorMetricsShard metricsShard;
 
     private final List<PendingTombstone> uncommittedTombstones = new ArrayList<>();
+    private final Set<String> metadataBootstrapTimerKeys = new HashSet<>();
 
     private boolean loading = true;
 
@@ -304,7 +312,13 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         }
 
         return new CoordinatorResult<>(
-            List.of(toCoordinatorRecord(preparedAppend.indexRecord())),
+            List.of(
+                toCoordinatorRecord(preparedAppend.indexRecord()),
+                toTopicMetadataRecord(
+                    preparedAppend.indexRecord().topicId(),
+                    preparedAppend.indexRecord().globalEndOffsetExclusive()
+                )
+            ),
             preparedAppend.indexRecord().toAppendResult(false)
         );
     }
@@ -437,6 +451,30 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         return CoordinatorRecord.record(key, new ApiMessageAndVersion(value, (short) 0));
     }
 
+    private CoordinatorRecord toTopicMetadataRecord(Uuid topicId, long nextGlobalOffset) {
+        return CoordinatorRecord.record(
+            new GlobalSequenceTopicMetadataKey().setTopicId(topicId),
+            new ApiMessageAndVersion(
+                new GlobalSequenceTopicMetadataValue().setNextGlobalOffset(nextGlobalOffset),
+                (short) 0
+            )
+        );
+    }
+
+    private void scheduleTopicMetadataBootstrap() {
+        stateRegistry.topicsMissingDurableMetadata().forEach((topicId, nextGlobalOffset) -> {
+            String timerKey = GLOBAL_SEQUENCE_METADATA_BOOTSTRAP_KEY_PREFIX + topicId;
+            metadataBootstrapTimerKeys.add(timerKey);
+            timer.schedule(
+                timerKey,
+                0L,
+                TimeUnit.MILLISECONDS,
+                true,
+                () -> new CoordinatorResult<>(List.of(toTopicMetadataRecord(topicId, nextGlobalOffset)))
+            );
+        });
+    }
+
     @Override
     public void onLoaded(MetadataImage newImage) {
         int cleared = stateRegistry.clearUncommittedAllocations();
@@ -445,6 +483,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         }
         uncommittedTombstones.clear();
         loading = false;
+        scheduleTopicMetadataBootstrap();
         coordinatorMetrics.activateMetricsShard(metricsShard);
     }
 
@@ -466,6 +505,8 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     @Override
     public void onUnloaded() {
         timer.cancel(GLOBAL_SEQUENCE_EXPIRATION_KEY);
+        metadataBootstrapTimerKeys.forEach(timer::cancel);
+        metadataBootstrapTimerKeys.clear();
         indexCache.clear();
         coordinatorMetrics.deactivateMetricsShard(metricsShard);
     }
@@ -480,6 +521,11 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
             throw new IllegalStateException("Unknown global sequence coordinator record type " + key.apiKey(), exception);
         }
 
+        if (recordType == CoordinatorRecordType.GLOBAL_SEQUENCE_TOPIC_METADATA &&
+            key instanceof GlobalSequenceTopicMetadataKey metadataKey) {
+            replayTopicMetadata(metadataKey, record.value());
+            return;
+        }
         if (recordType != CoordinatorRecordType.GLOBAL_SEQUENCE_INDEX_LOG ||
             !(key instanceof GlobalSequenceIndexLogKey indexKey)) {
             throw new IllegalStateException("Unexpected global sequence coordinator record " + record);
@@ -525,6 +571,18 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     public void replayEndTransactionMarker(long producerId, short producerEpoch, TransactionResult result) throws RuntimeException {
         // TODO: Implement here
         CoordinatorShard.super.replayEndTransactionMarker(producerId, producerEpoch, result);
+    }
+
+    private void replayTopicMetadata(
+        GlobalSequenceTopicMetadataKey key,
+        ApiMessageAndVersion value
+    ) {
+        if (value == null || value.version() != 0 ||
+            !(value.message() instanceof GlobalSequenceTopicMetadataValue metadataValue)) {
+            throw new IllegalStateException("Unexpected global sequence topic metadata value " + value);
+        }
+        stateRegistry.replayTopicMetadata(key.topicId(), metadataValue.nextGlobalOffset());
+        metadataBootstrapTimerKeys.remove(GLOBAL_SEQUENCE_METADATA_BOOTSTRAP_KEY_PREFIX + key.topicId());
     }
 
     private record PendingTombstone(Uuid topicId, long globalBaseOffset, long indexLogOffset) { }

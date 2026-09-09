@@ -20,6 +20,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.OffsetOutOfRangeException;
 import org.apache.kafka.timeline.SnapshotRegistry;
 import org.apache.kafka.timeline.TimelineHashMap;
+import org.apache.kafka.timeline.TimelineObject;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -137,6 +138,25 @@ public class GlobalSequenceStateRegistry {
 
         GlobalSequenceState state = stateMap.get(topicId);
         return state != null && state.replayTombstone(globalBaseOffset);
+    }
+
+    void replayTopicMetadata(Uuid topicId, long nextGlobalOffset) {
+        validateTopicId(topicId);
+        if (nextGlobalOffset < 0) {
+            throw new IllegalArgumentException("nextGlobalOffset must not be negative");
+        }
+        createNewTopicState(topicId);
+        stateMap.get(topicId).replayTopicMetadata(nextGlobalOffset);
+    }
+
+    Map<Uuid, Long> topicsMissingDurableMetadata() {
+        Map<Uuid, Long> result = new HashMap<>();
+        stateMap.forEach((topicId, state) -> {
+            if (!state.hasDurableMetadata() && state.nextGlobalOffset() > 0) {
+                result.put(topicId, state.nextGlobalOffset());
+            }
+        });
+        return Map.copyOf(result);
     }
 
     List<GlobalSequenceIndexRecord> promoteCommittedAllocations(long indexLogHighWatermark) {
@@ -275,11 +295,13 @@ public class GlobalSequenceStateRegistry {
         private final TimelineHashMap<Integer, Long> lastPhysicalBaseOffsetByPartition;
         private final Map<PhysicalBatchId, OverlayAllocation> uncommittedAllocations;
         private final GlobalOffsetSequencer offsetSequencer;
+        private final TimelineObject<Boolean> durableMetadataPresent;
 
         GlobalSequenceState(SnapshotRegistry snapshotRegistry) {
             this.lastPhysicalBaseOffsetByPartition = new TimelineHashMap<>(snapshotRegistry, 0);
             this.uncommittedAllocations = new HashMap<>();
             this.offsetSequencer = new BasicGlobalOffsetSequencer(snapshotRegistry);
+            this.durableMetadataPresent = new TimelineObject<>(snapshotRegistry, false);
         }
 
         long nextGlobalOffset() {
@@ -299,6 +321,21 @@ public class GlobalSequenceStateRegistry {
                 request.partitionIndex(),
                 request.partitionBaseOffset()
             ), false);
+        }
+
+        void replayTopicMetadata(long nextGlobalOffset) {
+            if (nextGlobalOffset < offsetSequencer.nextOffset()) {
+                throw new IllegalStateException(
+                    "Durable next global offset " + nextGlobalOffset +
+                        " is behind replayed next global offset " + offsetSequencer.nextOffset()
+                );
+            }
+            offsetSequencer.replayNextOffset(nextGlobalOffset);
+            durableMetadataPresent.set(true);
+        }
+
+        boolean hasDurableMetadata() {
+            return durableMetadataPresent.get();
         }
 
         boolean replay(

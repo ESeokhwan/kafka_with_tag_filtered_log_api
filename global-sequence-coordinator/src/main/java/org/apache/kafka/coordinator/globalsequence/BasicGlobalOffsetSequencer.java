@@ -43,4 +43,14 @@ public class BasicGlobalOffsetSequencer implements GlobalOffsetSequencer {
             nextOffset.set(allocationEndOffset);
         }
     }
+
+    @Override
+    public void replayNextOffset(long nextGlobalOffset) {
+        if (nextGlobalOffset < 0) {
+            throw new IllegalArgumentException("nextGlobalOffset must not be negative");
+        }
+        if (nextGlobalOffset > nextOffset.get()) {
+            nextOffset.set(nextGlobalOffset);
+        }
+    }
 }

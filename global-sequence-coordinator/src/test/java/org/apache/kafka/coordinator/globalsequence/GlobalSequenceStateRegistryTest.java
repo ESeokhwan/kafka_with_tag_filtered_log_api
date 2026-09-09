@@ -24,6 +24,7 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -196,6 +197,50 @@ class GlobalSequenceStateRegistryTest {
         assertFalse(registry.isNewPhysicalBatch(request(TOPIC_ID, 0, 10L, 3), 12L));
         assertTrue(registry.isNewPhysicalBatch(request(TOPIC_ID, 0, 11L, 1), 12L));
         assertFalse(registry.isNewPhysicalBatch(request(OTHER_TOPIC_ID, 0, 50L, 2), 12L));
+    }
+
+    @Test
+    void testDurableMetadataRestoresNextOffsetAfterAllocationCompaction() {
+        GlobalSequenceStateRegistry registry = newRegistry();
+
+        registry.replayTopicMetadata(TOPIC_ID, 100L);
+
+        assertEquals(100L, registry.getState(TOPIC_ID).nextGlobalOffset());
+        assertEquals(Map.of(), registry.topicsMissingDurableMetadata());
+        assertEquals(
+            100L,
+            registry.prepareAppend(request(TOPIC_ID, 0, 20L, 3)).indexRecord().globalBaseOffset()
+        );
+    }
+
+    @Test
+    void testLegacyAllocationIsReportedForMetadataBootstrap() {
+        GlobalSequenceStateRegistry registry = newRegistry();
+        registry.replay(record(TOPIC_ID, 7L, 3, 0, 20L), 10L, false);
+
+        assertEquals(Map.of(TOPIC_ID, 10L), registry.topicsMissingDurableMetadata());
+
+        registry.replayTopicMetadata(TOPIC_ID, 10L);
+        assertEquals(Map.of(), registry.topicsMissingDurableMetadata());
+        assertThrows(
+            IllegalStateException.class,
+            () -> registry.replayTopicMetadata(TOPIC_ID, 9L)
+        );
+    }
+
+    @Test
+    void testUncommittedDurableMetadataIsRolledBackWithSnapshot() {
+        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+        GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(snapshotRegistry);
+        registry.replay(record(TOPIC_ID, 7L, 3, 0, 20L), 10L, false);
+        snapshotRegistry.idempotentCreateSnapshot(11L);
+
+        registry.replayTopicMetadata(TOPIC_ID, 10L);
+        assertEquals(Map.of(), registry.topicsMissingDurableMetadata());
+
+        snapshotRegistry.revertToSnapshot(11L);
+        assertEquals(Map.of(TOPIC_ID, 10L), registry.topicsMissingDurableMetadata());
+        assertEquals(10L, registry.getState(TOPIC_ID).nextGlobalOffset());
     }
 
     @Test

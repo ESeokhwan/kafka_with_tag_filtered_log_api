@@ -27,4 +27,9 @@ public interface GlobalOffsetSequencer {
      * Advances the sequencer after a persisted allocation is replayed.
      */
     void replayAllocation(long globalBaseOffset, int recordCount);
+
+    /**
+     * Restores the durable first offset available for a new allocation.
+     */
+    void replayNextOffset(long nextGlobalOffset);
 }

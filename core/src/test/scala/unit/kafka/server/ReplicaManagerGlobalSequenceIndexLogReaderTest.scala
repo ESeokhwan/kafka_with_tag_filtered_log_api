@@ -21,7 +21,7 @@ import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException
 import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord
-import org.apache.kafka.coordinator.globalsequence.generated.{GlobalSequenceIndexLogKey, GlobalSequenceIndexLogValue}
+import org.apache.kafka.coordinator.globalsequence.generated.{GlobalSequenceIndexLogKey, GlobalSequenceIndexLogValue, GlobalSequenceTopicMetadataKey, GlobalSequenceTopicMetadataValue}
 import org.apache.kafka.coordinator.globalsequence.{GlobalSequenceCoordinatorRecordSerde, GlobalSequenceIndexLogEntry, GlobalSequenceIndexRecord}
 import org.apache.kafka.server.common.ApiMessageAndVersion
 import org.apache.kafka.server.storage.log.FetchIsolation
@@ -49,6 +49,7 @@ class ReplicaManagerGlobalSequenceIndexLogReaderTest {
       5L,
       Compression.NONE,
       serialized(allocationRecord(allocation)),
+      serialized(topicMetadataRecord(topicId, 13L)),
       serialized(tombstoneRecord(topicId, 20L))
     )
 
@@ -57,13 +58,13 @@ class ReplicaManagerGlobalSequenceIndexLogReaderTest {
       .thenReturn(new FetchDataInfo(new LogOffsetMetadata(5L), records))
 
     Using.resource(new ReplicaManagerGlobalSequenceIndexLogReader(replicaManager, 128)) { reader =>
-      val result = reader.read(topicPartition, 5L, 7L, 1024).get(10, TimeUnit.SECONDS)
+      val result = reader.read(topicPartition, 5L, 8L, 1024).get(10, TimeUnit.SECONDS)
 
       assertEquals(Seq(
         GlobalSequenceIndexLogEntry.allocation(5L, allocation),
-        GlobalSequenceIndexLogEntry.tombstone(6L, topicId, 20L)
+        GlobalSequenceIndexLogEntry.tombstone(7L, topicId, 20L)
       ), result.entries.toArray.toSeq)
-      assertEquals(7L, result.nextLogOffset)
+      assertEquals(8L, result.nextLogOffset)
       assertTrue(result.reachedEndOffset)
       assertEquals(records.sizeInBytes, result.bytesRead)
       verify(log).read(5L, 128, FetchIsolation.HIGH_WATERMARK, true)
@@ -126,6 +127,16 @@ class ReplicaManagerGlobalSequenceIndexLogReaderTest {
       new GlobalSequenceIndexLogKey()
         .setTopicId(topicId)
         .setGlobalOffset(globalBaseOffset)
+    )
+  }
+
+  private def topicMetadataRecord(topicId: Uuid, nextGlobalOffset: Long): CoordinatorRecord = {
+    CoordinatorRecord.record(
+      new GlobalSequenceTopicMetadataKey().setTopicId(topicId),
+      new ApiMessageAndVersion(
+        new GlobalSequenceTopicMetadataValue().setNextGlobalOffset(nextGlobalOffset),
+        0.toShort
+      )
     )
   }
 }

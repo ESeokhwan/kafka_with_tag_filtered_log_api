@@ -21,7 +21,7 @@ import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException
 import org.apache.kafka.common.record.{FileRecords, MemoryRecords}
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord
-import org.apache.kafka.coordinator.globalsequence.generated.{GlobalSequenceIndexLogKey, GlobalSequenceIndexLogValue}
+import org.apache.kafka.coordinator.globalsequence.generated.{GlobalSequenceIndexLogKey, GlobalSequenceIndexLogValue, GlobalSequenceTopicMetadataKey}
 import org.apache.kafka.coordinator.globalsequence.{GlobalSequenceCoordinatorRecordSerde, GlobalSequenceIndexLogEntry, GlobalSequenceIndexLogReadResult, GlobalSequenceIndexLogReader, GlobalSequenceIndexRecord}
 import org.apache.kafka.server.storage.log.FetchIsolation
 import org.apache.kafka.server.util.KafkaScheduler
@@ -121,7 +121,9 @@ class ReplicaManagerGlobalSequenceIndexLogReader(
         if (!batch.isControlBatch && batch.baseOffset < endLogOffsetExclusive) {
           batch.asScala.iterator
             .takeWhile(_.offset < endLogOffsetExclusive)
-            .foreach { record => entries += decode(record.offset, serde.deserialize(record.key, record.value)) }
+            .foreach { record =>
+              decode(record.offset, serde.deserialize(record.key, record.value)).foreach(entries += _)
+            }
         }
         nextLogOffset = Math.max(nextLogOffset, Math.min(batch.nextOffset, endLogOffsetExclusive))
       }
@@ -140,25 +142,24 @@ class ReplicaManagerGlobalSequenceIndexLogReader(
     }
   }
 
-  private def decode(logOffset: Long, record: CoordinatorRecord): GlobalSequenceIndexLogEntry = {
-    val key = record.key match {
-      case indexKey: GlobalSequenceIndexLogKey => indexKey
+  private def decode(logOffset: Long, record: CoordinatorRecord): Option[GlobalSequenceIndexLogEntry] = {
+    record.key match {
+      case key: GlobalSequenceIndexLogKey if record.value == null =>
+        Some(GlobalSequenceIndexLogEntry.tombstone(logOffset, key.topicId, key.globalOffset))
+      case key: GlobalSequenceIndexLogKey =>
+        record.value.message match {
+          case value: GlobalSequenceIndexLogValue =>
+            Some(GlobalSequenceIndexLogEntry.allocation(logOffset, new GlobalSequenceIndexRecord(
+              key.topicId,
+              key.globalOffset,
+              value.recordsCount,
+              value.partitionIndex,
+              value.partitionOffset
+            )))
+          case other => throw new IllegalStateException(s"Unexpected global sequence index value $other")
+        }
+      case _: GlobalSequenceTopicMetadataKey => None
       case other => throw new IllegalStateException(s"Unexpected global sequence index key $other")
-    }
-    if (record.value == null) {
-      GlobalSequenceIndexLogEntry.tombstone(logOffset, key.topicId, key.globalOffset)
-    } else {
-      record.value.message match {
-        case value: GlobalSequenceIndexLogValue =>
-          GlobalSequenceIndexLogEntry.allocation(logOffset, new GlobalSequenceIndexRecord(
-            key.topicId,
-            key.globalOffset,
-            value.recordsCount,
-            value.partitionIndex,
-            value.partitionOffset
-          ))
-        case other => throw new IllegalStateException(s"Unexpected global sequence index value $other")
-      }
     }
   }
 

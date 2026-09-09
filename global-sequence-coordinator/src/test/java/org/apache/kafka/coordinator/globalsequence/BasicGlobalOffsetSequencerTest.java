@@ -61,6 +61,18 @@ class BasicGlobalOffsetSequencerTest {
     }
 
     @Test
+    void testReplayNextOffsetRestoresDurableWatermarkWithoutRewinding() {
+        BasicGlobalOffsetSequencer sequencer = newSequencer();
+
+        sequencer.replayNextOffset(10L);
+        assertEquals(10L, sequencer.nextOffset());
+
+        sequencer.replayNextOffset(5L);
+        assertEquals(10L, sequencer.nextOffset());
+        assertThrows(IllegalArgumentException.class, () -> sequencer.replayNextOffset(-1L));
+    }
+
+    @Test
     void testSnapshotRollbackRestoresNextOffset() {
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
         BasicGlobalOffsetSequencer sequencer = new BasicGlobalOffsetSequencer(snapshotRegistry);

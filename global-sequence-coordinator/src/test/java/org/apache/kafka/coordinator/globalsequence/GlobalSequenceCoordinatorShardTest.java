@@ -30,6 +30,8 @@ import org.apache.kafka.coordinator.common.runtime.CoordinatorResult;
 import org.apache.kafka.coordinator.common.runtime.MockCoordinatorTimer;
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceIndexLogKey;
 import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceIndexLogValue;
+import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceTopicMetadataKey;
+import org.apache.kafka.coordinator.globalsequence.generated.GlobalSequenceTopicMetadataValue;
 import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.timeline.SnapshotRegistry;
@@ -52,6 +54,7 @@ class GlobalSequenceCoordinatorShardTest {
 
     private GlobalSequenceStateRegistry stateRegistry;
     private SnapshotRegistry snapshotRegistry;
+    private MockCoordinatorTimer<Void, CoordinatorRecord> timer;
     private GlobalSequenceCoordinatorShard shard;
 
     @BeforeEach
@@ -60,6 +63,7 @@ class GlobalSequenceCoordinatorShardTest {
         MockTime time = new MockTime();
         snapshotRegistry = new SnapshotRegistry(logContext);
         stateRegistry = new GlobalSequenceStateRegistry(snapshotRegistry);
+        timer = new MockCoordinatorTimer<>(time);
 
         GlobalSequenceCoordinatorConfig config = new GlobalSequenceCoordinatorConfig(
             new AbstractConfig(GlobalSequenceCoordinatorConfig.CONFIG_DEF, Map.of())
@@ -69,7 +73,7 @@ class GlobalSequenceCoordinatorShardTest {
             stateRegistry,
             new GlobalSequenceIndexCache(config.indexCacheMaxEntries()),
             time,
-            new MockCoordinatorTimer<>(time),
+            timer,
             config,
             mock(CoordinatorMetrics.class),
             mock(CoordinatorMetricsShard.class)
@@ -99,14 +103,17 @@ class GlobalSequenceCoordinatorShardTest {
                 (short) 0
             )
         );
+        CoordinatorRecord expectedMetadataRecord = topicMetadataRecord(TOPIC_ID, 3L);
 
         assertEquals(new GlobalSequenceAppendResult(0L, 3, false), result.response());
-        assertEquals(1, result.records().size());
+        assertEquals(2, result.records().size());
         assertEquals(expectedRecord, result.records().get(0));
+        assertEquals(expectedMetadataRecord, result.records().get(1));
         assertTrue(result.replayRecords());
         assertFalse(stateRegistry.contains(TOPIC_ID));
 
         replay(expectedRecord);
+        replay(expectedMetadataRecord);
 
         assertEquals(
             new GlobalSequenceLookupResult(List.of(
@@ -273,6 +280,24 @@ class GlobalSequenceCoordinatorShardTest {
             request(TOPIC_ID, 0, 40L, 2)
         );
         assertEquals(new GlobalSequenceAppendResult(10L, 2, false), next.response());
+    }
+
+    @Test
+    void testOnLoadedBootstrapsMetadataForLegacyAllocationLog() {
+        replay(coordinatorRecord(new GlobalSequenceIndexRecord(TOPIC_ID, 7L, 3, 2, 30L)));
+
+        shard.onLoaded(MetadataImage.EMPTY);
+
+        List<MockCoordinatorTimer.ExpiredTimeout<Void, CoordinatorRecord>> expired = timer.poll();
+        assertEquals(1, expired.size());
+        assertEquals(
+            GlobalSequenceCoordinatorShard.GLOBAL_SEQUENCE_METADATA_BOOTSTRAP_KEY_PREFIX + TOPIC_ID,
+            expired.get(0).key
+        );
+        assertEquals(List.of(topicMetadataRecord(TOPIC_ID, 10L)), expired.get(0).result.records());
+
+        replay(expired.get(0).result.records().get(0));
+        assertEquals(Map.of(), stateRegistry.topicsMissingDurableMetadata());
     }
 
     @Test
@@ -488,6 +513,7 @@ class GlobalSequenceCoordinatorShardTest {
         GlobalSequenceAppendRequest firstRequest = request(TOPIC_ID, 0, 20L, 1);
         CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> first = shard.appendIndex(firstRequest);
         replay(first.records().get(0));
+        replay(first.records().get(1));
 
         assertEquals(1, stateRegistry.uncommittedAllocationCount());
         assertEquals(
@@ -495,7 +521,7 @@ class GlobalSequenceCoordinatorShardTest {
             shard.appendIndex(firstRequest).response()
         );
 
-        shard.onHighWatermarkUpdated(1L);
+        shard.onHighWatermarkUpdated(2L);
 
         assertEquals(0, stateRegistry.uncommittedAllocationCount());
         assertEquals(
@@ -560,6 +586,16 @@ class GlobalSequenceCoordinatorShardTest {
                     .setRecordsCount(indexRecord.recordCount())
                     .setPartitionIndex(indexRecord.partitionIndex())
                     .setPartitionOffset(indexRecord.partitionBaseOffset()),
+                (short) 0
+            )
+        );
+    }
+
+    private static CoordinatorRecord topicMetadataRecord(Uuid topicId, long nextGlobalOffset) {
+        return CoordinatorRecord.record(
+            new GlobalSequenceTopicMetadataKey().setTopicId(topicId),
+            new ApiMessageAndVersion(
+                new GlobalSequenceTopicMetadataValue().setNextGlobalOffset(nextGlobalOffset),
                 (short) 0
             )
         );
