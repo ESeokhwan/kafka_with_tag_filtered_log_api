@@ -44,6 +44,21 @@ public interface CoordinatorShard<U> {
     default void onNewMetadataImage(MetadataImage newImage, MetadataDelta delta) {}
 
     /**
+     * The coordinator log high watermark has advanced. This is invoked before write operations
+     * waiting for the new high watermark are completed.
+     *
+     * @param offset the new log high watermark
+     */
+    default void onHighWatermarkUpdated(long offset) {}
+
+    /**
+     * The coordinator log has been rolled back to the supplied end offset.
+     *
+     * @param offset the new log end offset
+     */
+    default void onWrittenOffsetReverted(long offset) {}
+
+    /**
      * The coordinator has been unloaded. This is used to apply
      * any post unloading operations.
      */

@@ -17,6 +17,7 @@
 package org.apache.kafka.coordinator.globalsequence;
 
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.protocol.ApiMessage;
 import org.apache.kafka.common.protocol.Errors;
@@ -42,6 +43,7 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 
 import org.slf4j.Logger;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -160,6 +162,8 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
 
     private final CoordinatorMetricsShard metricsShard;
 
+    private final List<PendingTombstone> uncommittedTombstones = new ArrayList<>();
+
     private boolean loading = true;
 
     GlobalSequenceCoordinatorShard(
@@ -195,20 +199,11 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         return appendResult(preparedAppend);
     }
 
-    CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> appendIndex(
-        GlobalSequenceAppendRequest request,
-        long indexLogHighWatermark
-    ) {
-        promoteCommittedAllocations(indexLogHighWatermark);
-        return appendIndex(request);
-    }
-
     GlobalSequenceAppendPreparation prepareAppend(
         GlobalSequenceAppendRequest request,
         long indexLogHighWatermark,
         int coordinatorLeaderEpoch
     ) {
-        promoteCommittedAllocations(indexLogHighWatermark);
         if (stateRegistry.isNewPhysicalBatch(request, indexLogHighWatermark)) {
             return GlobalSequenceAppendPreparation.fresh();
         }
@@ -250,7 +245,6 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
             );
         }
 
-        promoteCommittedAllocations(currentIndexLogHighWatermark);
         GlobalSequenceAppendRequest request = plan.request();
         GlobalSequenceStateRegistry.PreparedAppend rechecked = stateRegistry.prepareAppend(request);
         if (rechecked.duplicate()) {
@@ -327,7 +321,6 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         long indexLogHighWatermark,
         int coordinatorLeaderEpoch
     ) {
-        promoteCommittedAllocations(indexLogHighWatermark);
         int maxIndexEntries = Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries());
         Optional<GlobalSequenceLookupResult> cachedResult = lookupCached(request, maxIndexEntries);
         if (cachedResult.isPresent()) {
@@ -403,6 +396,17 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         }
     }
 
+    private void applyCommittedTombstones(long indexLogHighWatermark) {
+        List<PendingTombstone> committed = uncommittedTombstones.stream()
+            .filter(tombstone -> tombstone.indexLogOffset() < indexLogHighWatermark)
+            .toList();
+        for (PendingTombstone tombstone : committed) {
+            stateRegistry.replayTombstone(tombstone.topicId(), tombstone.globalBaseOffset());
+            indexCache.remove(tombstone.topicId(), tombstone.globalBaseOffset());
+        }
+        uncommittedTombstones.removeAll(committed);
+    }
+
     private void addRetainedAllocations(long delta) {
         if (metricsShard instanceof GlobalSequenceCoordinatorMetricsShard globalSequenceMetricsShard) {
             globalSequenceMetricsShard.addRetainedAllocations(delta);
@@ -439,8 +443,24 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         if (cleared > 0) {
             addRetainedAllocations(-cleared);
         }
+        uncommittedTombstones.clear();
         loading = false;
         coordinatorMetrics.activateMetricsShard(metricsShard);
+    }
+
+    @Override
+    public void onHighWatermarkUpdated(long offset) {
+        promoteCommittedAllocations(offset);
+        applyCommittedTombstones(offset);
+    }
+
+    @Override
+    public void onWrittenOffsetReverted(long offset) {
+        int rolledBack = stateRegistry.rollbackUncommittedAllocations(offset);
+        if (rolledBack > 0) {
+            addRetainedAllocations(-rolledBack);
+        }
+        uncommittedTombstones.removeIf(tombstone -> tombstone.indexLogOffset() >= offset);
     }
 
     @Override
@@ -467,10 +487,16 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
 
         ApiMessageAndVersion value = record.value();
         if (value == null) {
-            if (stateRegistry.replayTombstone(indexKey.topicId(), indexKey.globalOffset())) {
-                addRetainedAllocations(-1L);
+            if (loading) {
+                stateRegistry.replayTombstone(indexKey.topicId(), indexKey.globalOffset());
+                indexCache.remove(indexKey.topicId(), indexKey.globalOffset());
+            } else {
+                uncommittedTombstones.add(new PendingTombstone(
+                    indexKey.topicId(),
+                    indexKey.globalOffset(),
+                    offset
+                ));
             }
-            indexCache.remove(indexKey.topicId(), indexKey.globalOffset());
             return;
         }
         if (value.version() != 0 || !(value.message() instanceof GlobalSequenceIndexLogValue indexValue)) {
@@ -500,4 +526,6 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         // TODO: Implement here
         CoordinatorShard.super.replayEndTransactionMarker(producerId, producerEpoch, result);
     }
+
+    private record PendingTombstone(Uuid topicId, long globalBaseOffset, long indexLogOffset) { }
 }

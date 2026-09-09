@@ -22,6 +22,7 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 import org.apache.kafka.timeline.TimelineHashMap;
 import org.apache.kafka.timeline.TimelineHashSet;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
@@ -55,6 +56,8 @@ public class MockCoordinatorShard implements CoordinatorShard<String> {
     private final TimelineHashMap<Long, TimelineHashSet<RecordAndMetadata>> pendingRecords;
     private final CoordinatorTimer<Void, String> timer;
     private final CoordinatorExecutor<String> executor;
+    private final List<Long> highWatermarks = new ArrayList<>();
+    private final List<Long> revertedOffsets = new ArrayList<>();
 
     MockCoordinatorShard(
         SnapshotRegistry snapshotRegistry,
@@ -113,6 +116,16 @@ public class MockCoordinatorShard implements CoordinatorShard<String> {
         }
     }
 
+    @Override
+    public void onHighWatermarkUpdated(long offset) {
+        highWatermarks.add(offset);
+    }
+
+    @Override
+    public void onWrittenOffsetReverted(long offset) {
+        revertedOffsets.add(offset);
+    }
+
     Set<String> pendingRecords(long producerId) {
         TimelineHashSet<RecordAndMetadata> pending = pendingRecords.get(producerId);
         if (pending == null) return Set.of();
@@ -136,5 +149,13 @@ public class MockCoordinatorShard implements CoordinatorShard<String> {
 
     CoordinatorExecutor<String> executor() {
         return executor;
+    }
+
+    List<Long> highWatermarks() {
+        return List.copyOf(highWatermarks);
+    }
+
+    List<Long> revertedOffsets() {
+        return List.copyOf(revertedOffsets);
     }
 }

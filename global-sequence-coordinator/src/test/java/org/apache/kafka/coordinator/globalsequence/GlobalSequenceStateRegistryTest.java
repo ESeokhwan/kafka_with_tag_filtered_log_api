@@ -73,15 +73,22 @@ class GlobalSequenceStateRegistryTest {
 
     @Test
     void testCommittedAllocationsLeaveOnlyBoundedConsumers() {
-        GlobalSequenceStateRegistry registry = newRegistry();
+        GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(
+            new SnapshotRegistry(new LogContext()),
+            1,
+            2
+        );
         GlobalSequenceIndexRecord first = record(TOPIC_ID, 0L, 1, 0, 10L);
         GlobalSequenceIndexRecord second = record(TOPIC_ID, 1L, 1, 0, 11L);
         registry.replay(first, 10L);
         registry.replay(second, 11L);
 
+        assertEquals(0, registry.checkpointCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));
         assertEquals(List.of(first), registry.promoteCommittedAllocations(11L));
+        assertEquals(1, registry.checkpointCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));
         assertEquals(1, registry.uncommittedAllocationCount());
         assertEquals(List.of(second), registry.promoteCommittedAllocations(12L));
+        assertEquals(2, registry.checkpointCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));
         assertEquals(0, registry.uncommittedAllocationCount());
 
         GlobalSequenceStateRegistry.PreparedAppend retry = registry.prepareAppend(
@@ -236,18 +243,19 @@ class GlobalSequenceStateRegistryTest {
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
         GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(snapshotRegistry, 1, 2);
         GlobalSequenceIndexRecord first = record(TOPIC_ID, 0L, 2, 0, 10L);
-        registry.replay(first, 0L);
+        registry.replay(first, 0L, false);
         snapshotRegistry.idempotentCreateSnapshot(1L);
 
         registry.replay(record(TOPIC_ID, 2L, 3, 1, 20L), 1L);
         registry.replay(record(OTHER_TOPIC_ID, 0L, 4, 0, 30L), 2L);
-        assertEquals(3, registry.uncommittedAllocationCount());
+        assertEquals(2, registry.uncommittedAllocationCount());
 
+        assertEquals(2, registry.rollbackUncommittedAllocations(1L));
         snapshotRegistry.revertToSnapshot(1L);
 
         assertEquals(2L, registry.getState(TOPIC_ID).nextGlobalOffset());
-        assertEquals(1, registry.uncommittedAllocationCount());
-        assertTrue(registry.prepareAppend(request(TOPIC_ID, 0, 10L, 2)).duplicate());
+        assertEquals(0, registry.uncommittedAllocationCount());
+        assertFalse(registry.prepareAppend(request(TOPIC_ID, 0, 10L, 2)).duplicate());
         assertTrue(registry.isNewPhysicalBatch(request(TOPIC_ID, 1, 20L, 3), 1L));
         assertFalse(registry.contains(OTHER_TOPIC_ID));
         assertEquals(1, registry.checkpointCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));

@@ -22,6 +22,8 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 import org.apache.kafka.timeline.TimelineHashMap;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -121,17 +123,9 @@ public class GlobalSequenceStateRegistry {
             return false;
         }
 
-        checkpointIndex.replayAllocation(
-            indexRecord.topicId(),
-            indexRecord.globalBaseOffset(),
-            indexLogOffset
-        );
-        physicalCheckpointIndex.replayAllocation(
-            indexRecord.topicId(),
-            indexRecord.partitionIndex(),
-            indexRecord.partitionBaseOffset(),
-            indexLogOffset
-        );
+        if (!retainInUncommittedOverlay) {
+            replayCommittedAllocation(indexRecord, indexLogOffset);
+        }
         return true;
     }
 
@@ -146,11 +140,29 @@ public class GlobalSequenceStateRegistry {
     }
 
     List<GlobalSequenceIndexRecord> promoteCommittedAllocations(long indexLogHighWatermark) {
-        List<GlobalSequenceIndexRecord> committed = new ArrayList<>();
+        List<OverlayAllocation> committedAllocations = new ArrayList<>();
         for (GlobalSequenceState state : stateMap.values()) {
-            state.promoteCommittedAllocations(indexLogHighWatermark, committed);
+            state.removeCommittedAllocations(indexLogHighWatermark, committedAllocations);
+        }
+        committedAllocations.sort(Comparator.comparingLong(OverlayAllocation::indexLogOffset));
+
+        List<GlobalSequenceIndexRecord> committed = new ArrayList<>(committedAllocations.size());
+        for (OverlayAllocation allocation : committedAllocations) {
+            replayCommittedAllocation(allocation.indexRecord(), allocation.indexLogOffset());
+            committed.add(allocation.indexRecord());
         }
         return committed;
+    }
+
+    int rollbackUncommittedAllocations(long indexLogEndOffset) {
+        int rolledBack = 0;
+        for (GlobalSequenceState state : stateMap.values()) {
+            rolledBack = Math.addExact(
+                rolledBack,
+                state.rollbackUncommittedAllocations(indexLogEndOffset)
+            );
+        }
+        return rolledBack;
     }
 
     int clearUncommittedAllocations() {
@@ -220,6 +232,23 @@ public class GlobalSequenceStateRegistry {
         return physicalCheckpointIndex.numCheckpoints(topicId, partitionIndex, epoch);
     }
 
+    private void replayCommittedAllocation(
+        GlobalSequenceIndexRecord indexRecord,
+        long indexLogOffset
+    ) {
+        checkpointIndex.replayAllocation(
+            indexRecord.topicId(),
+            indexRecord.globalBaseOffset(),
+            indexLogOffset
+        );
+        physicalCheckpointIndex.replayAllocation(
+            indexRecord.topicId(),
+            indexRecord.partitionIndex(),
+            indexRecord.partitionBaseOffset(),
+            indexLogOffset
+        );
+    }
+
     static OffsetOutOfRangeException outOfRange(
         GlobalSequenceLookupRequest request,
         long missingOffset
@@ -244,12 +273,12 @@ public class GlobalSequenceStateRegistry {
 
     public static class GlobalSequenceState {
         private final TimelineHashMap<Integer, Long> lastPhysicalBaseOffsetByPartition;
-        private final TimelineHashMap<PhysicalBatchId, OverlayAllocation> uncommittedAllocations;
+        private final Map<PhysicalBatchId, OverlayAllocation> uncommittedAllocations;
         private final GlobalOffsetSequencer offsetSequencer;
 
         GlobalSequenceState(SnapshotRegistry snapshotRegistry) {
             this.lastPhysicalBaseOffsetByPartition = new TimelineHashMap<>(snapshotRegistry, 0);
-            this.uncommittedAllocations = new TimelineHashMap<>(snapshotRegistry, 0);
+            this.uncommittedAllocations = new HashMap<>();
             this.offsetSequencer = new BasicGlobalOffsetSequencer(snapshotRegistry);
         }
 
@@ -343,9 +372,9 @@ public class GlobalSequenceStateRegistry {
             return matchingBatch.map(uncommittedAllocations::remove).isPresent();
         }
 
-        void promoteCommittedAllocations(
+        void removeCommittedAllocations(
             long indexLogHighWatermark,
-            List<GlobalSequenceIndexRecord> committed
+            List<OverlayAllocation> committed
         ) {
             List<PhysicalBatchId> committedBatches = uncommittedAllocations.entrySet().stream()
                 .filter(entry -> entry.getValue().indexLogOffset() < indexLogHighWatermark)
@@ -354,9 +383,18 @@ public class GlobalSequenceStateRegistry {
             for (PhysicalBatchId physicalBatchId : committedBatches) {
                 OverlayAllocation allocation = uncommittedAllocations.remove(physicalBatchId);
                 if (allocation != null) {
-                    committed.add(allocation.indexRecord());
+                    committed.add(allocation);
                 }
             }
+        }
+
+        int rollbackUncommittedAllocations(long indexLogEndOffset) {
+            List<PhysicalBatchId> rolledBackBatches = uncommittedAllocations.entrySet().stream()
+                .filter(entry -> entry.getValue().indexLogOffset() >= indexLogEndOffset)
+                .map(Map.Entry::getKey)
+                .toList();
+            rolledBackBatches.forEach(uncommittedAllocations::remove);
+            return rolledBackBatches.size();
         }
 
         int clearUncommittedAllocations() {

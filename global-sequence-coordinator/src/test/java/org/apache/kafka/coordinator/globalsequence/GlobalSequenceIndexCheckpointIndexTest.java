@@ -68,7 +68,7 @@ class GlobalSequenceIndexCheckpointIndexTest {
     }
 
     @Test
-    void testSnapshotRollbackRestoresPrunedCheckpointsAndCount() {
+    void testCommittedCheckpointsAreNotRolledBackWithUncommittedState() {
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
         GlobalSequenceIndexCheckpointIndex index = new GlobalSequenceIndexCheckpointIndex(snapshotRegistry, 4, 2);
         replay(index, 13);
@@ -82,11 +82,11 @@ class GlobalSequenceIndexCheckpointIndexTest {
         snapshotRegistry.revertToSnapshot(0L);
 
         assertEquals(
-            List.of(checkpoint(0), checkpoint(8), checkpoint(12)),
+            List.of(checkpoint(0), checkpoint(8), checkpoint(16), checkpoint(20)),
             index.checkpoints(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH)
         );
-        assertEquals(13L, index.allocationCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));
-        assertTrue(index.floor(TOPIC_ID, 120L, SnapshotRegistry.LATEST_EPOCH).isPresent());
+        assertEquals(21L, index.allocationCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));
+        assertTrue(index.floor(TOPIC_ID, 200L, SnapshotRegistry.LATEST_EPOCH).isPresent());
     }
 
     private static GlobalSequenceIndexCheckpointIndex newIndex() {

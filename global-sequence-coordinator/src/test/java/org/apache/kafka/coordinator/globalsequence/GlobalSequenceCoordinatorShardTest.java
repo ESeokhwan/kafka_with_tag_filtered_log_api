@@ -334,6 +334,51 @@ class GlobalSequenceCoordinatorShardTest {
     }
 
     @Test
+    void testTombstoneDoesNotInvalidateCommittedCacheBeforeHighWatermark() {
+        GlobalSequenceIndexRecord existing = new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 3, 1, 20L);
+        replay(coordinatorRecord(existing));
+        shard.onLoaded(MetadataImage.EMPTY);
+
+        shard.replay(
+            1L,
+            RecordBatch.NO_PRODUCER_ID,
+            RecordBatch.NO_PRODUCER_EPOCH,
+            CoordinatorRecord.tombstone(
+                new GlobalSequenceIndexLogKey().setTopicId(TOPIC_ID).setGlobalOffset(0L)
+            )
+        );
+
+        GlobalSequenceLookupRequest request = new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 3L);
+        assertEquals(new GlobalSequenceLookupResult(List.of(existing)), shard.lookupIndex(request, 1L));
+
+        shard.onHighWatermarkUpdated(2L);
+        assertThrows(OffsetOutOfRangeException.class, () -> shard.lookupIndex(request, 2L));
+    }
+
+    @Test
+    void testRolledBackTombstoneDoesNotInvalidateCommittedCache() {
+        GlobalSequenceIndexRecord existing = new GlobalSequenceIndexRecord(TOPIC_ID, 0L, 3, 1, 20L);
+        replay(coordinatorRecord(existing));
+        shard.onLoaded(MetadataImage.EMPTY);
+        shard.replay(
+            1L,
+            RecordBatch.NO_PRODUCER_ID,
+            RecordBatch.NO_PRODUCER_EPOCH,
+            CoordinatorRecord.tombstone(
+                new GlobalSequenceIndexLogKey().setTopicId(TOPIC_ID).setGlobalOffset(0L)
+            )
+        );
+
+        shard.onWrittenOffsetReverted(1L);
+        shard.onHighWatermarkUpdated(2L);
+
+        assertEquals(
+            new GlobalSequenceLookupResult(List.of(existing)),
+            shard.lookupIndex(new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 3L), 2L)
+        );
+    }
+
+    @Test
     void testTopicsHaveIndependentSequences() {
         Uuid otherTopicId = Uuid.randomUuid();
         CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> first = shard.appendIndex(
@@ -441,19 +486,16 @@ class GlobalSequenceCoordinatorShardTest {
     void testCommittedReplayMovesFromOverlayToBoundedCache() {
         shard.onLoaded(MetadataImage.EMPTY);
         GlobalSequenceAppendRequest firstRequest = request(TOPIC_ID, 0, 20L, 1);
-        CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> first = shard.appendIndex(
-            firstRequest,
-            0L
-        );
+        CoordinatorResult<GlobalSequenceAppendResult, CoordinatorRecord> first = shard.appendIndex(firstRequest);
         replay(first.records().get(0));
 
         assertEquals(1, stateRegistry.uncommittedAllocationCount());
         assertEquals(
             new GlobalSequenceAppendResult(0L, 1, true),
-            shard.appendIndex(firstRequest, 0L).response()
+            shard.appendIndex(firstRequest).response()
         );
 
-        shard.appendIndex(request(TOPIC_ID, 0, 21L, 1), 1L);
+        shard.onHighWatermarkUpdated(1L);
 
         assertEquals(0, stateRegistry.uncommittedAllocationCount());
         assertEquals(

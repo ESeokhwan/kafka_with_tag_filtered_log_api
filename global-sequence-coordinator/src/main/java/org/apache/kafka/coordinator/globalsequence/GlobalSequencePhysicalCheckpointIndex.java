@@ -18,31 +18,30 @@ package org.apache.kafka.coordinator.globalsequence;
 
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.timeline.SnapshotRegistry;
-import org.apache.kafka.timeline.TimelineHashMap;
-import org.apache.kafka.timeline.TimelineLong;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Snapshot-aware leveled sparse checkpoints for physical batch lookups in the index log.
+ * Committed leveled sparse checkpoints for physical batch lookups in the index log.
  */
 public class GlobalSequencePhysicalCheckpointIndex {
-    private final SnapshotRegistry snapshotRegistry;
     private final int checkpointInterval;
     private final int levelFactor;
-    private final TimelineHashMap<PhysicalPartitionId, PartitionCheckpoints> checkpointsByPartition;
+    private final Map<PhysicalPartitionId, PartitionCheckpoints> checkpointsByPartition;
 
     public GlobalSequencePhysicalCheckpointIndex(
         SnapshotRegistry snapshotRegistry,
         int checkpointInterval,
         int levelFactor
     ) {
-        this.snapshotRegistry = Objects.requireNonNull(snapshotRegistry, "snapshotRegistry");
+        Objects.requireNonNull(snapshotRegistry, "snapshotRegistry");
         if (checkpointInterval <= 0) {
             throw new IllegalArgumentException("checkpointInterval must be positive");
         }
@@ -51,7 +50,7 @@ public class GlobalSequencePhysicalCheckpointIndex {
         }
         this.checkpointInterval = checkpointInterval;
         this.levelFactor = levelFactor;
-        this.checkpointsByPartition = new TimelineHashMap<>(snapshotRegistry, 0);
+        this.checkpointsByPartition = new HashMap<>();
     }
 
     public boolean replayAllocation(
@@ -70,7 +69,7 @@ public class GlobalSequencePhysicalCheckpointIndex {
 
         PartitionCheckpoints partitionCheckpoints = checkpointsByPartition.get(partitionId);
         if (partitionCheckpoints == null) {
-            partitionCheckpoints = new PartitionCheckpoints(snapshotRegistry);
+            partitionCheckpoints = new PartitionCheckpoints();
             checkpointsByPartition.put(partitionId, partitionCheckpoints);
         }
         return partitionCheckpoints.replayAllocation(physicalBaseOffset, indexLogOffset);
@@ -86,31 +85,29 @@ public class GlobalSequencePhysicalCheckpointIndex {
         if (physicalBaseOffset < 0) {
             throw new IllegalArgumentException("physicalBaseOffset must not be negative");
         }
-        PartitionCheckpoints partitionCheckpoints = checkpointsByPartition.get(partitionId, epoch);
+        PartitionCheckpoints partitionCheckpoints = checkpointsByPartition.get(partitionId);
         if (partitionCheckpoints == null) {
             return Optional.empty();
         }
-        return partitionCheckpoints.floor(physicalBaseOffset, epoch);
+        return partitionCheckpoints.floor(physicalBaseOffset);
     }
 
     public int numCheckpoints(Uuid topicId, int partitionIndex, long epoch) {
         PartitionCheckpoints partitionCheckpoints = checkpointsByPartition.get(
-            new PhysicalPartitionId(topicId, partitionIndex),
-            epoch
+            new PhysicalPartitionId(topicId, partitionIndex)
         );
-        return partitionCheckpoints == null ? 0 : partitionCheckpoints.byOrdinal.size(epoch);
+        return partitionCheckpoints == null ? 0 : partitionCheckpoints.byOrdinal.size();
     }
 
     List<GlobalSequencePhysicalCheckpoint> checkpoints(Uuid topicId, int partitionIndex, long epoch) {
         PartitionCheckpoints partitionCheckpoints = checkpointsByPartition.get(
-            new PhysicalPartitionId(topicId, partitionIndex),
-            epoch
+            new PhysicalPartitionId(topicId, partitionIndex)
         );
         if (partitionCheckpoints == null) {
             return List.of();
         }
         List<GlobalSequencePhysicalCheckpoint> result = new ArrayList<>(
-            partitionCheckpoints.byOrdinal.values(epoch)
+            partitionCheckpoints.byOrdinal.values()
         );
         result.sort(Comparator.comparingLong(GlobalSequencePhysicalCheckpoint::allocationOrdinal));
         return result;
@@ -123,17 +120,16 @@ public class GlobalSequencePhysicalCheckpointIndex {
     }
 
     private final class PartitionCheckpoints {
-        private final TimelineHashMap<Long, GlobalSequencePhysicalCheckpoint> byOrdinal;
-        private final TimelineLong allocationCount;
+        private final Map<Long, GlobalSequencePhysicalCheckpoint> byOrdinal;
+        private long allocationCount;
 
-        private PartitionCheckpoints(SnapshotRegistry snapshotRegistry) {
-            this.byOrdinal = new TimelineHashMap<>(snapshotRegistry, 0);
-            this.allocationCount = new TimelineLong(snapshotRegistry);
+        private PartitionCheckpoints() {
+            this.byOrdinal = new HashMap<>();
         }
 
         private boolean replayAllocation(long physicalBaseOffset, long indexLogOffset) {
-            long ordinal = allocationCount.get();
-            allocationCount.set(Math.addExact(ordinal, 1L));
+            long ordinal = allocationCount;
+            allocationCount = Math.addExact(ordinal, 1L);
             if (ordinal % checkpointInterval != 0) {
                 return false;
             }
@@ -146,8 +142,8 @@ public class GlobalSequencePhysicalCheckpointIndex {
             return true;
         }
 
-        private Optional<GlobalSequencePhysicalCheckpoint> floor(long physicalBaseOffset, long epoch) {
-            return byOrdinal.values(epoch).stream()
+        private Optional<GlobalSequencePhysicalCheckpoint> floor(long physicalBaseOffset) {
+            return byOrdinal.values().stream()
                 .filter(checkpoint -> checkpoint.physicalBaseOffset() <= physicalBaseOffset)
                 .max(Comparator.comparingLong(GlobalSequencePhysicalCheckpoint::physicalBaseOffset));
         }

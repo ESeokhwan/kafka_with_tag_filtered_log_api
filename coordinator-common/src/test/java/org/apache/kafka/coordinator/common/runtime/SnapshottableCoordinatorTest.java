@@ -23,6 +23,8 @@ import org.apache.kafka.timeline.SnapshotRegistry;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -34,10 +36,14 @@ public class SnapshottableCoordinatorTest {
     public void testUpdateLastWrittenOffset() {
         LogContext logContext = new LogContext();
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(logContext);
+        MockCoordinatorShard shard = new MockCoordinatorShard(
+            snapshotRegistry,
+            new MockCoordinatorTimer<>(new MockTime())
+        );
         SnapshottableCoordinator<MockCoordinatorShard, String> coordinator = new SnapshottableCoordinator<>(
             logContext,
             snapshotRegistry,
-            new MockCoordinatorShard(snapshotRegistry, new MockCoordinatorTimer<>(new MockTime())),
+            shard,
             new TopicPartition("test-topic", 0)
         );
 
@@ -68,10 +74,14 @@ public class SnapshottableCoordinatorTest {
     public void testRevertWrittenOffset() {
         LogContext logContext = new LogContext();
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(logContext);
+        MockCoordinatorShard shard = new MockCoordinatorShard(
+            snapshotRegistry,
+            new MockCoordinatorTimer<>(new MockTime())
+        );
         SnapshottableCoordinator<MockCoordinatorShard, String> coordinator = new SnapshottableCoordinator<>(
             logContext,
             snapshotRegistry,
-            new MockCoordinatorShard(snapshotRegistry, new MockCoordinatorTimer<>(new MockTime())),
+            shard,
             new TopicPartition("test-topic", 0)
         );
 
@@ -85,16 +95,21 @@ public class SnapshottableCoordinatorTest {
         assertEquals(100L, coordinator.lastWrittenOffset());
         assertTrue(coordinator.snapshotRegistry().hasSnapshot(100L));
         assertFalse(coordinator.snapshotRegistry().hasSnapshot(200L));
+        assertEquals(List.of(100L), shard.revertedOffsets());
     }
 
     @Test
     public void testRevertLastWrittenOffsetFailed() {
         LogContext logContext = new LogContext();
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(logContext);
+        MockCoordinatorShard shard = new MockCoordinatorShard(
+            snapshotRegistry,
+            new MockCoordinatorTimer<>(new MockTime())
+        );
         SnapshottableCoordinator<MockCoordinatorShard, String> coordinator = new SnapshottableCoordinator<>(
             logContext,
             snapshotRegistry,
-            new MockCoordinatorShard(snapshotRegistry, new MockCoordinatorTimer<>(new MockTime())),
+            shard,
             new TopicPartition("test-topic", 0)
         );
 
@@ -107,10 +122,14 @@ public class SnapshottableCoordinatorTest {
     public void testUpdateLastCommittedOffset() {
         LogContext logContext = new LogContext();
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(logContext);
+        MockCoordinatorShard shard = new MockCoordinatorShard(
+            snapshotRegistry,
+            new MockCoordinatorTimer<>(new MockTime())
+        );
         SnapshottableCoordinator<MockCoordinatorShard, String> coordinator = new SnapshottableCoordinator<>(
             logContext,
             snapshotRegistry,
-            new MockCoordinatorShard(snapshotRegistry, new MockCoordinatorTimer<>(new MockTime())),
+            shard,
             new TopicPartition("test-topic", 0)
         );
 
@@ -122,6 +141,10 @@ public class SnapshottableCoordinatorTest {
         assertEquals(100L, coordinator.lastCommittedOffset());
         assertFalse(coordinator.snapshotRegistry().hasSnapshot(0L));
         assertTrue(coordinator.snapshotRegistry().hasSnapshot(100L));
+        assertEquals(List.of(100L), shard.highWatermarks());
+
+        coordinator.updateLastCommittedOffset(100L);
+        assertEquals(List.of(100L), shard.highWatermarks());
     }
 
     @Test

@@ -794,11 +794,13 @@ public class CoordinatorRuntimeTest {
         ), writer.entries(TP));
 
         // Commit write #1.
+        assertEquals(List.of(), ctx.coordinator.coordinator().highWatermarks());
         writer.commit(TP, 2);
 
         // The write is completed.
         assertTrue(write1.isDone());
         assertEquals("response1", write1.get(5, TimeUnit.SECONDS));
+        assertEquals(List.of(2L), ctx.coordinator.coordinator().highWatermarks());
 
         // The last committed offset is updated.
         assertEquals(2L, ctx.coordinator.lastCommittedOffset());
@@ -813,6 +815,7 @@ public class CoordinatorRuntimeTest {
         assertTrue(write3.isDone());
         assertEquals("response2", write2.get(5, TimeUnit.SECONDS));
         assertEquals("response3", write3.get(5, TimeUnit.SECONDS));
+        assertEquals(List.of(2L, 3L), ctx.coordinator.coordinator().highWatermarks());
 
         // The last committed offset is updated.
         assertEquals(3L, ctx.coordinator.lastCommittedOffset());

@@ -93,6 +93,7 @@ public class SnapshottableCoordinator<S extends CoordinatorShard<U>, U> implemen
         }
 
         log.debug("Revert last written offset of {} to {}.", tp, offset);
+        coordinator.onWrittenOffsetReverted(offset);
         lastWrittenOffset = offset;
         snapshotRegistry.revertToSnapshot(offset);
     }
@@ -168,8 +169,11 @@ public class SnapshottableCoordinator<S extends CoordinatorShard<U>, U> implemen
                 " must be less than or equal to " + lastWrittenOffset + ".");
         }
 
-        lastCommittedOffset = offset;
-        snapshotRegistry.deleteSnapshotsUpTo(offset);
+        if (offset > lastCommittedOffset) {
+            coordinator.onHighWatermarkUpdated(offset);
+            lastCommittedOffset = offset;
+            snapshotRegistry.deleteSnapshotsUpTo(offset);
+        }
         log.debug("Updated committed offset of {} to {}.", tp, offset);
     }
 

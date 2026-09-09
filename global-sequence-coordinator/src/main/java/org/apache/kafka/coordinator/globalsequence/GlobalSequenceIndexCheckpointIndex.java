@@ -18,36 +18,37 @@ package org.apache.kafka.coordinator.globalsequence;
 
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.timeline.SnapshotRegistry;
-import org.apache.kafka.timeline.TimelineHashMap;
-import org.apache.kafka.timeline.TimelineLong;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Snapshot-aware leveled sparse checkpoints for global sequence index log positions.
+ * Committed leveled sparse checkpoints for global sequence index log positions.
  *
  * <p>The newest level retains one checkpoint per {@code checkpointInterval} allocations. Once a
  * checkpoint gets older than {@code levelFactor} intervals, the next level retains one out of each
  * {@code levelFactor} checkpoints. This repeats geometrically, keeping old data addressable while
- * bounding retained checkpoints to O(levelFactor * log(allocationCount)).</p>
+ * bounding retained checkpoints to O(levelFactor * log(allocationCount)). Checkpoints are only
+ * updated by committed replay or a high-watermark callback, so coordinator snapshot rollback must
+ * not roll them back.</p>
  */
 public class GlobalSequenceIndexCheckpointIndex {
-    private final SnapshotRegistry snapshotRegistry;
     private final int checkpointInterval;
     private final int levelFactor;
-    private final TimelineHashMap<Uuid, TopicCheckpoints> checkpointsByTopic;
+    private final Map<Uuid, TopicCheckpoints> checkpointsByTopic;
 
     public GlobalSequenceIndexCheckpointIndex(
         SnapshotRegistry snapshotRegistry,
         int checkpointInterval,
         int levelFactor
     ) {
-        this.snapshotRegistry = Objects.requireNonNull(snapshotRegistry, "snapshotRegistry");
+        Objects.requireNonNull(snapshotRegistry, "snapshotRegistry");
         if (checkpointInterval <= 0) {
             throw new IllegalArgumentException("checkpointInterval must be positive");
         }
@@ -56,7 +57,7 @@ public class GlobalSequenceIndexCheckpointIndex {
         }
         this.checkpointInterval = checkpointInterval;
         this.levelFactor = levelFactor;
-        this.checkpointsByTopic = new TimelineHashMap<>(snapshotRegistry, 0);
+        this.checkpointsByTopic = new HashMap<>();
     }
 
     public boolean replayAllocation(Uuid topicId, long globalBaseOffset, long indexLogOffset) {
@@ -70,7 +71,7 @@ public class GlobalSequenceIndexCheckpointIndex {
 
         TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId);
         if (topicCheckpoints == null) {
-            topicCheckpoints = new TopicCheckpoints(snapshotRegistry);
+            topicCheckpoints = new TopicCheckpoints();
             checkpointsByTopic.put(topicId, topicCheckpoints);
         }
         return topicCheckpoints.replayAllocation(globalBaseOffset, indexLogOffset);
@@ -85,32 +86,32 @@ public class GlobalSequenceIndexCheckpointIndex {
         if (globalOffset < 0) {
             throw new IllegalArgumentException("globalOffset must not be negative");
         }
-        TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId, epoch);
+        TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId);
         if (topicCheckpoints == null) {
             return Optional.empty();
         }
-        return topicCheckpoints.floor(globalOffset, epoch);
+        return topicCheckpoints.floor(globalOffset);
     }
 
     public long allocationCount(Uuid topicId, long epoch) {
         validateTopicId(topicId);
-        TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId, epoch);
-        return topicCheckpoints == null ? 0L : topicCheckpoints.allocationCount.get(epoch);
+        TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId);
+        return topicCheckpoints == null ? 0L : topicCheckpoints.allocationCount;
     }
 
     public int numCheckpoints(Uuid topicId, long epoch) {
         validateTopicId(topicId);
-        TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId, epoch);
-        return topicCheckpoints == null ? 0 : topicCheckpoints.byOrdinal.size(epoch);
+        TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId);
+        return topicCheckpoints == null ? 0 : topicCheckpoints.byOrdinal.size();
     }
 
     List<GlobalSequenceIndexCheckpoint> checkpoints(Uuid topicId, long epoch) {
         validateTopicId(topicId);
-        TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId, epoch);
+        TopicCheckpoints topicCheckpoints = checkpointsByTopic.get(topicId);
         if (topicCheckpoints == null) {
             return List.of();
         }
-        List<GlobalSequenceIndexCheckpoint> result = new ArrayList<>(topicCheckpoints.byOrdinal.values(epoch));
+        List<GlobalSequenceIndexCheckpoint> result = new ArrayList<>(topicCheckpoints.byOrdinal.values());
         result.sort(Comparator.comparingLong(GlobalSequenceIndexCheckpoint::allocationOrdinal));
         return result;
     }
@@ -123,17 +124,16 @@ public class GlobalSequenceIndexCheckpointIndex {
     }
 
     private final class TopicCheckpoints {
-        private final TimelineHashMap<Long, GlobalSequenceIndexCheckpoint> byOrdinal;
-        private final TimelineLong allocationCount;
+        private final Map<Long, GlobalSequenceIndexCheckpoint> byOrdinal;
+        private long allocationCount;
 
-        private TopicCheckpoints(SnapshotRegistry snapshotRegistry) {
-            this.byOrdinal = new TimelineHashMap<>(snapshotRegistry, 0);
-            this.allocationCount = new TimelineLong(snapshotRegistry);
+        private TopicCheckpoints() {
+            this.byOrdinal = new HashMap<>();
         }
 
         private boolean replayAllocation(long globalBaseOffset, long indexLogOffset) {
-            long ordinal = allocationCount.get();
-            allocationCount.set(Math.addExact(ordinal, 1L));
+            long ordinal = allocationCount;
+            allocationCount = Math.addExact(ordinal, 1L);
             if (ordinal % checkpointInterval != 0) {
                 return false;
             }
@@ -146,8 +146,8 @@ public class GlobalSequenceIndexCheckpointIndex {
             return true;
         }
 
-        private Optional<GlobalSequenceIndexCheckpoint> floor(long globalOffset, long epoch) {
-            return byOrdinal.values(epoch).stream()
+        private Optional<GlobalSequenceIndexCheckpoint> floor(long globalOffset) {
+            return byOrdinal.values().stream()
                 .filter(checkpoint -> checkpoint.globalBaseOffset() <= globalOffset)
                 .max(Comparator.comparingLong(GlobalSequenceIndexCheckpoint::globalBaseOffset));
         }
