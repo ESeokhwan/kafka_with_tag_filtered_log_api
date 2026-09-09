@@ -20,6 +20,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.errors.InvalidRequestException;
 import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.CompressionType;
@@ -43,8 +44,12 @@ import org.apache.kafka.server.util.timer.Timer;
 import org.slf4j.Logger;
 
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Properties;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -61,6 +66,7 @@ public class GlobalSequenceCoordinator {
         private Timer timer;
         private CoordinatorRuntimeMetrics coordinatorRuntimeMetrics;
         private GlobalSequenceCoordinatorMetrics coordinatorMetrics;
+        private GlobalSequenceIndexLogReader indexLogReader;
 
         public Builder(
                 int nodeId,
@@ -100,6 +106,11 @@ public class GlobalSequenceCoordinator {
             return this;
         }
 
+        public Builder withIndexLogReader(GlobalSequenceIndexLogReader indexLogReader) {
+            this.indexLogReader = indexLogReader;
+            return this;
+        }
+
         @SuppressWarnings("NPathComplexity")
         public GlobalSequenceCoordinator build() {
             if (config == null)
@@ -116,6 +127,8 @@ public class GlobalSequenceCoordinator {
                 throw new IllegalArgumentException("CoordinatorRuntimeMetrics must be set.");
             if (coordinatorMetrics == null)
                 throw new IllegalArgumentException("CoordinatorMetrics must be set.");
+            if (indexLogReader == null)
+                throw new IllegalArgumentException("GlobalSequenceIndexLogReader must be set.");
 
             String logPrefix = String.format("GlobalSequenceCoordinator id=%d", nodeId);
             LogContext logContext = new LogContext(String.format("[%s] ", logPrefix));
@@ -154,7 +167,8 @@ public class GlobalSequenceCoordinator {
                     logContext,
                     config,
                     runtime,
-                    coordinatorMetrics
+                    coordinatorMetrics,
+                    indexLogReader
             );
         }
     }
@@ -166,6 +180,8 @@ public class GlobalSequenceCoordinator {
     private final CoordinatorRuntime<GlobalSequenceCoordinatorShard, CoordinatorRecord> runtime;
 
     private final GlobalSequenceCoordinatorMetrics coordinatorMetrics;
+
+    private final GlobalSequenceIndexLogReader indexLogReader;
 
     /**
      * The number of partitions of the __global_sequence_index topics. This is provided
@@ -182,12 +198,14 @@ public class GlobalSequenceCoordinator {
             LogContext logContext,
             GlobalSequenceCoordinatorConfig config,
             CoordinatorRuntime<GlobalSequenceCoordinatorShard, CoordinatorRecord> runtime,
-            GlobalSequenceCoordinatorMetrics coordinatorMetrics
+            GlobalSequenceCoordinatorMetrics coordinatorMetrics,
+            GlobalSequenceIndexLogReader indexLogReader
     ) {
         this.log = logContext.logger(GlobalSequenceCoordinator.class);
         this.config = config;
         this.runtime = runtime;
         this.coordinatorMetrics = coordinatorMetrics;
+        this.indexLogReader = indexLogReader;
     }
 
     /**
@@ -242,11 +260,76 @@ public class GlobalSequenceCoordinator {
             GlobalSequenceLookupRequest request
     ) {
         throwIfNotActive();
-        return runtime.scheduleReadOperation(
-            "lookup-global-sequence-index",
-            topicPartitionFor(request.topicId()),
-            (coordinator, indexLogHighWatermark) -> coordinator.lookupIndex(request, indexLogHighWatermark)
-        );
+        TopicPartition topicPartition = topicPartitionFor(request.topicId());
+        return runtime.<GlobalSequenceIndexLookupPlan>scheduleReadOperation(
+            "prepare-global-sequence-index-lookup",
+            topicPartition,
+            (coordinator, indexLogHighWatermark) -> coordinator.prepareLookup(request, indexLogHighWatermark)
+        ).thenCompose(plan -> {
+            if (plan.cachedResult().isPresent()) {
+                return CompletableFuture.completedFuture(plan.cachedResult().get());
+            }
+            ScanAccumulator accumulator = new ScanAccumulator(
+                request,
+                Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries())
+            );
+            return scanIndex(topicPartition, plan, accumulator).thenCompose(result ->
+                runtime.scheduleReadOperation(
+                    "complete-global-sequence-index-lookup",
+                    topicPartition,
+                    (coordinator, ignoredHighWatermark) -> coordinator.completeLookup(request, result)
+                )
+            );
+        });
+    }
+
+    private CompletableFuture<GlobalSequenceLookupResult> scanIndex(
+        TopicPartition topicPartition,
+        GlobalSequenceIndexLookupPlan plan,
+        ScanAccumulator accumulator
+    ) {
+        return scanIndexChunk(topicPartition, plan, plan.startIndexLogOffset(), accumulator);
+    }
+
+    private CompletableFuture<GlobalSequenceLookupResult> scanIndexChunk(
+        TopicPartition topicPartition,
+        GlobalSequenceIndexLookupPlan plan,
+        long nextLogOffset,
+        ScanAccumulator accumulator
+    ) {
+        long remainingScanBytes = config.indexLookupMaxScanBytes() - accumulator.bytesRead();
+        int readMaxBytes = (int) Math.min(config.indexLogReadMaxBytes(), remainingScanBytes);
+        return indexLogReader.read(
+            topicPartition,
+            nextLogOffset,
+            plan.endIndexLogOffsetExclusive(),
+            readMaxBytes
+        ).thenCompose(readResult -> {
+            coordinatorMetrics.record(GlobalSequenceCoordinatorMetrics.INDEX_LOG_READS_SENSOR_NAME);
+            coordinatorMetrics.record(
+                GlobalSequenceCoordinatorMetrics.INDEX_LOG_READ_BYTES_SENSOR_NAME,
+                readResult.bytesRead()
+            );
+            accumulator.addBytes(readResult.bytesRead());
+            accumulator.add(readResult.entries());
+
+            Optional<GlobalSequenceLookupResult> resolved = accumulator.resolve(readResult.reachedEndOffset());
+            if (resolved.isPresent()) {
+                return CompletableFuture.completedFuture(resolved.get());
+            }
+            if (accumulator.bytesRead() >= config.indexLookupMaxScanBytes()) {
+                return CompletableFuture.failedFuture(new InvalidRequestException(
+                    "Global sequence index lookup exceeded the configured scan limit of " +
+                        config.indexLookupMaxScanBytes() + " bytes."
+                ));
+            }
+            if (readResult.nextLogOffset() <= nextLogOffset) {
+                return CompletableFuture.failedFuture(new IllegalStateException(
+                    "Global sequence index log reader did not make progress from offset " + nextLogOffset
+                ));
+            }
+            return scanIndexChunk(topicPartition, plan, readResult.nextLogOffset(), accumulator);
+        });
     }
 
     public void onElection(
@@ -299,8 +382,85 @@ public class GlobalSequenceCoordinator {
 
         log.info("Shutting down.");
         isActive.set(false);
+        Utils.closeQuietly(indexLogReader, "global sequence index log reader");
         Utils.closeQuietly(runtime, "coordinator runtime");
         Utils.closeQuietly(coordinatorMetrics, "global sequence coordinator metrics");
         log.info("Shutdown complete.");
+    }
+
+    private static final class ScanAccumulator {
+        private final GlobalSequenceLookupRequest request;
+        private final int maxIndexEntries;
+        private final TreeMap<Long, GlobalSequenceIndexRecord> candidates = new TreeMap<>();
+        private long bytesRead;
+
+        private ScanAccumulator(GlobalSequenceLookupRequest request, int maxIndexEntries) {
+            this.request = request;
+            this.maxIndexEntries = maxIndexEntries;
+        }
+
+        private void addBytes(int bytes) {
+            bytesRead = Math.addExact(bytesRead, bytes);
+        }
+
+        private long bytesRead() {
+            return bytesRead;
+        }
+
+        private void add(List<GlobalSequenceIndexLogEntry> entries) {
+            for (GlobalSequenceIndexLogEntry entry : entries) {
+                if (!request.topicId().equals(entry.topicId())) {
+                    continue;
+                }
+                if (entry.indexRecord().isEmpty()) {
+                    candidates.remove(entry.globalBaseOffset());
+                    continue;
+                }
+                GlobalSequenceIndexRecord indexRecord = entry.indexRecord().get();
+                if (indexRecord.globalEndOffsetExclusive() > request.globalStartOffset() &&
+                    indexRecord.globalBaseOffset() < request.globalEndOffsetExclusive()) {
+                    candidates.put(indexRecord.globalBaseOffset(), indexRecord);
+                }
+            }
+        }
+
+        private Optional<GlobalSequenceLookupResult> resolve(boolean reachedEndOffset) {
+            Map.Entry<Long, GlobalSequenceIndexRecord> current = candidates.floorEntry(
+                request.globalStartOffset()
+            );
+            if (current == null ||
+                current.getValue().globalEndOffsetExclusive() <= request.globalStartOffset()) {
+                if ((!candidates.isEmpty() && candidates.firstKey() > request.globalStartOffset()) || reachedEndOffset) {
+                    throw GlobalSequenceStateRegistry.outOfRange(request, request.globalStartOffset());
+                }
+                return Optional.empty();
+            }
+
+            List<GlobalSequenceIndexRecord> matches = new java.util.ArrayList<>();
+            long nextOffsetToCover = request.globalStartOffset();
+            while (current != null) {
+                GlobalSequenceIndexRecord indexRecord = current.getValue();
+                if (indexRecord.globalBaseOffset() > nextOffsetToCover) {
+                    throw GlobalSequenceStateRegistry.outOfRange(request, nextOffsetToCover);
+                }
+                if (indexRecord.globalEndOffsetExclusive() > nextOffsetToCover) {
+                    matches.add(indexRecord);
+                    nextOffsetToCover = Math.min(
+                        indexRecord.globalEndOffsetExclusive(),
+                        request.globalEndOffsetExclusive()
+                    );
+                    if (nextOffsetToCover == request.globalEndOffsetExclusive() ||
+                        matches.size() == maxIndexEntries) {
+                        return Optional.of(new GlobalSequenceLookupResult(matches));
+                    }
+                }
+                current = candidates.higherEntry(current.getKey());
+            }
+
+            if (reachedEndOffset) {
+                throw GlobalSequenceStateRegistry.outOfRange(request, nextOffsetToCover);
+            }
+            return Optional.empty();
+        }
     }
 }

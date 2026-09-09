@@ -55,17 +55,20 @@ class GlobalSequenceCoordinatorTest {
 
     private CoordinatorRuntime<GlobalSequenceCoordinatorShard, CoordinatorRecord> runtime;
     private GlobalSequenceCoordinatorMetrics metrics;
+    private GlobalSequenceIndexLogReader indexLogReader;
     private GlobalSequenceCoordinator coordinator;
 
     @BeforeEach
     void setUp() {
         runtime = mockRuntime();
         metrics = mock(GlobalSequenceCoordinatorMetrics.class);
+        indexLogReader = mock(GlobalSequenceIndexLogReader.class);
         coordinator = new GlobalSequenceCoordinator(
             new LogContext(),
             config(),
             runtime,
-            metrics
+            metrics,
+            indexLogReader
         );
     }
 
@@ -153,35 +156,121 @@ class GlobalSequenceCoordinatorTest {
         GlobalSequenceLookupResult expectedResult = new GlobalSequenceLookupResult(List.of(
             new GlobalSequenceIndexRecord(request.topicId(), 0L, 5, 1, 10L)
         ));
-        CompletableFuture<GlobalSequenceLookupResult> expectedFuture =
-            CompletableFuture.completedFuture(expectedResult);
+        GlobalSequenceIndexLookupPlan expectedPlan = GlobalSequenceIndexLookupPlan.cached(expectedResult, 10L);
+        CompletableFuture<GlobalSequenceIndexLookupPlan> expectedFuture =
+            CompletableFuture.completedFuture(expectedPlan);
         TopicPartition expectedTopicPartition = new TopicPartition(
             Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME,
             Utils.abs(request.topicId().hashCode()) % NUM_PARTITIONS
         );
 
-        when(runtime.<GlobalSequenceLookupResult>scheduleReadOperation(
-            eq("lookup-global-sequence-index"),
+        when(runtime.<GlobalSequenceIndexLookupPlan>scheduleReadOperation(
+            eq("prepare-global-sequence-index-lookup"),
             eq(expectedTopicPartition),
             any()
         )).thenReturn(expectedFuture);
 
         coordinator.startup(() -> NUM_PARTITIONS);
-        assertSame(expectedFuture, coordinator.lookupIndex(request));
+        assertEquals(expectedResult, coordinator.lookupIndex(request).join());
 
         ArgumentCaptor<CoordinatorRuntime.CoordinatorReadOperation<
             GlobalSequenceCoordinatorShard,
-            GlobalSequenceLookupResult
-            >> operationCaptor = readOperationCaptor();
+            GlobalSequenceIndexLookupPlan
+            >> operationCaptor = lookupPlanOperationCaptor();
         verify(runtime).scheduleReadOperation(
-            eq("lookup-global-sequence-index"),
+            eq("prepare-global-sequence-index-lookup"),
             eq(expectedTopicPartition),
             operationCaptor.capture()
         );
 
         GlobalSequenceCoordinatorShard shard = mock(GlobalSequenceCoordinatorShard.class);
-        when(shard.lookupIndex(request, 10L)).thenReturn(expectedResult);
-        assertSame(expectedResult, operationCaptor.getValue().generateResponse(shard, 10L));
+        when(shard.prepareLookup(request, 10L)).thenReturn(expectedPlan);
+        assertSame(expectedPlan, operationCaptor.getValue().generateResponse(shard, 10L));
+    }
+
+    @Test
+    void testLookupScansIndexLogFromCheckpointAndCompletesOnCoordinatorShard() {
+        GlobalSequenceLookupRequest request = new GlobalSequenceLookupRequest(
+            Uuid.randomUuid(),
+            2L,
+            5L
+        );
+        TopicPartition topicPartition = new TopicPartition(
+            Topic.GLOBAL_SEQUENCE_INDEX_TOPIC_NAME,
+            Utils.abs(request.topicId().hashCode()) % NUM_PARTITIONS
+        );
+        GlobalSequenceIndexLookupPlan plan = GlobalSequenceIndexLookupPlan.scan(4L, 10L);
+        GlobalSequenceIndexRecord first = new GlobalSequenceIndexRecord(
+            request.topicId(), 0L, 3, 0, 20L
+        );
+        GlobalSequenceIndexRecord second = new GlobalSequenceIndexRecord(
+            request.topicId(), 3L, 2, 1, 30L
+        );
+        GlobalSequenceLookupResult expected = new GlobalSequenceLookupResult(List.of(first, second));
+        GlobalSequenceCoordinatorShard shard = mock(GlobalSequenceCoordinatorShard.class);
+
+        when(runtime.<GlobalSequenceIndexLookupPlan>scheduleReadOperation(
+            eq("prepare-global-sequence-index-lookup"),
+            eq(topicPartition),
+            any()
+        )).thenReturn(CompletableFuture.completedFuture(plan));
+        when(indexLogReader.read(
+            eq(topicPartition),
+            eq(4L),
+            eq(10L),
+            eq(GlobalSequenceCoordinatorConfig.INDEX_LOG_READ_MAX_BYTES_DEFAULT)
+        ))
+            .thenReturn(CompletableFuture.completedFuture(new GlobalSequenceIndexLogReadResult(
+                List.of(
+                    GlobalSequenceIndexLogEntry.allocation(4L, new GlobalSequenceIndexRecord(
+                        Uuid.randomUuid(), 0L, 1, 0, 0L
+                    )),
+                    GlobalSequenceIndexLogEntry.allocation(5L, first)
+                ),
+                6L,
+                false,
+                128
+            )));
+        when(indexLogReader.read(
+            eq(topicPartition),
+            eq(6L),
+            eq(10L),
+            eq(GlobalSequenceCoordinatorConfig.INDEX_LOG_READ_MAX_BYTES_DEFAULT)
+        ))
+            .thenReturn(CompletableFuture.completedFuture(new GlobalSequenceIndexLogReadResult(
+                List.of(GlobalSequenceIndexLogEntry.allocation(6L, second)),
+                7L,
+                false,
+                128
+            )));
+        when(shard.completeLookup(eq(request), eq(expected))).thenReturn(expected);
+        when(runtime.<GlobalSequenceLookupResult>scheduleReadOperation(
+            eq("complete-global-sequence-index-lookup"),
+            eq(topicPartition),
+            any()
+        )).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            CoordinatorRuntime.CoordinatorReadOperation<GlobalSequenceCoordinatorShard, GlobalSequenceLookupResult>
+                operation = invocation.getArgument(2);
+            return CompletableFuture.completedFuture(operation.generateResponse(shard, 10L));
+        });
+
+        coordinator.startup(() -> NUM_PARTITIONS);
+
+        assertEquals(expected, coordinator.lookupIndex(request).join());
+        verify(indexLogReader).read(
+            topicPartition,
+            4L,
+            10L,
+            GlobalSequenceCoordinatorConfig.INDEX_LOG_READ_MAX_BYTES_DEFAULT
+        );
+        verify(indexLogReader).read(
+            topicPartition,
+            6L,
+            10L,
+            GlobalSequenceCoordinatorConfig.INDEX_LOG_READ_MAX_BYTES_DEFAULT
+        );
+        verify(shard).completeLookup(request, expected);
     }
 
     @Test
@@ -210,6 +299,7 @@ class GlobalSequenceCoordinatorTest {
 
         verify(runtime, times(1)).close();
         verify(metrics, times(1)).close();
+        verify(indexLogReader, times(1)).close();
         assertThrows(CoordinatorNotAvailableException.class, () -> coordinator.appendIndex(request()));
     }
 
@@ -241,8 +331,8 @@ class GlobalSequenceCoordinatorTest {
     @SuppressWarnings("unchecked")
     private static ArgumentCaptor<CoordinatorRuntime.CoordinatorReadOperation<
         GlobalSequenceCoordinatorShard,
-        GlobalSequenceLookupResult
-        >> readOperationCaptor() {
+        GlobalSequenceIndexLookupPlan
+        >> lookupPlanOperationCaptor() {
         return ArgumentCaptor.forClass(CoordinatorRuntime.CoordinatorReadOperation.class);
     }
 }

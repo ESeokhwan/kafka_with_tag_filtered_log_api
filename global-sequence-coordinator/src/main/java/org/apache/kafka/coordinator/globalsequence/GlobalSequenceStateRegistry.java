@@ -25,6 +25,7 @@ import org.apache.kafka.timeline.TimelineLong;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The replay-driven state owned by one global sequence coordinator shard.
@@ -33,18 +34,55 @@ public class GlobalSequenceStateRegistry {
     private final SnapshotRegistry snapshotRegistry;
     private final TimelineHashMap<Uuid, GlobalSequenceState> stateMap;
     private final int maxLookupIndexEntries;
+    private final int maxRetainedIndexEntries;
+    private final GlobalSequenceIndexCheckpointIndex checkpointIndex;
+    private final TimelineHashMap<Long, RetainedAllocation> retainedAllocations;
+    private final TimelineLong replaySequence;
 
     public GlobalSequenceStateRegistry(SnapshotRegistry snapshotRegistry) {
-        this(snapshotRegistry, GlobalSequenceCoordinatorConfig.MAX_LOOKUP_INDEX_ENTRIES_DEFAULT);
+        this(
+            snapshotRegistry,
+            GlobalSequenceCoordinatorConfig.MAX_LOOKUP_INDEX_ENTRIES_DEFAULT,
+            GlobalSequenceCoordinatorConfig.INDEX_CACHE_MAX_ENTRIES_DEFAULT,
+            GlobalSequenceCoordinatorConfig.INDEX_CHECKPOINT_INTERVAL_DEFAULT,
+            GlobalSequenceCoordinatorConfig.INDEX_CHECKPOINT_LEVEL_FACTOR_DEFAULT
+        );
     }
 
     public GlobalSequenceStateRegistry(SnapshotRegistry snapshotRegistry, int maxLookupIndexEntries) {
+        this(
+            snapshotRegistry,
+            maxLookupIndexEntries,
+            GlobalSequenceCoordinatorConfig.INDEX_CACHE_MAX_ENTRIES_DEFAULT,
+            GlobalSequenceCoordinatorConfig.INDEX_CHECKPOINT_INTERVAL_DEFAULT,
+            GlobalSequenceCoordinatorConfig.INDEX_CHECKPOINT_LEVEL_FACTOR_DEFAULT
+        );
+    }
+
+    public GlobalSequenceStateRegistry(
+        SnapshotRegistry snapshotRegistry,
+        int maxLookupIndexEntries,
+        int maxRetainedIndexEntries,
+        int checkpointInterval,
+        int checkpointLevelFactor
+    ) {
         this.snapshotRegistry = Objects.requireNonNull(snapshotRegistry, "snapshotRegistry");
         if (maxLookupIndexEntries <= 0) {
             throw new IllegalArgumentException("maxLookupIndexEntries must be positive");
         }
+        if (maxRetainedIndexEntries <= 0) {
+            throw new IllegalArgumentException("maxRetainedIndexEntries must be positive");
+        }
         this.maxLookupIndexEntries = maxLookupIndexEntries;
+        this.maxRetainedIndexEntries = maxRetainedIndexEntries;
         this.stateMap = new TimelineHashMap<>(snapshotRegistry, 0);
+        this.checkpointIndex = new GlobalSequenceIndexCheckpointIndex(
+            snapshotRegistry,
+            checkpointInterval,
+            checkpointLevelFactor
+        );
+        this.retainedAllocations = new TimelineHashMap<>(snapshotRegistry, 0);
+        this.replaySequence = new TimelineLong(snapshotRegistry);
     }
 
     public GlobalSequenceState getState(Uuid topicId) {
@@ -78,9 +116,43 @@ public class GlobalSequenceStateRegistry {
     }
 
     boolean replay(GlobalSequenceIndexRecord indexRecord) {
+        return replay(indexRecord, indexRecord.globalBaseOffset());
+    }
+
+    boolean replay(GlobalSequenceIndexRecord indexRecord, long indexLogOffset) {
         Objects.requireNonNull(indexRecord, "indexRecord");
+        if (indexLogOffset < 0) {
+            throw new IllegalArgumentException("indexLogOffset must not be negative");
+        }
         createNewTopicState(indexRecord.topicId());
-        return stateMap.get(indexRecord.topicId()).replay(indexRecord);
+        ReplayResult replayResult = stateMap.get(indexRecord.topicId()).replay(indexRecord);
+        if (!replayResult.added()) {
+            return false;
+        }
+
+        checkpointIndex.replayAllocation(
+            indexRecord.topicId(),
+            indexRecord.globalBaseOffset(),
+            indexLogOffset
+        );
+        long sequence = replaySequence.get();
+        retainedAllocations.put(
+            sequence,
+            new RetainedAllocation(indexRecord.topicId(), replayResult.allocationOrdinal(), indexRecord)
+        );
+        replaySequence.set(Math.addExact(sequence, 1L));
+        if (sequence >= maxRetainedIndexEntries) {
+            RetainedAllocation evicted = retainedAllocations.remove(sequence - maxRetainedIndexEntries);
+            if (evicted == null) {
+                throw new IllegalStateException("Missing retained global sequence allocation during eviction");
+            }
+            GlobalSequenceState state = stateMap.get(evicted.topicId());
+            if (state == null) {
+                throw new IllegalStateException("Missing global sequence topic state during eviction");
+            }
+            state.evict(evicted.allocationOrdinal(), evicted.indexRecord());
+        }
+        return true;
     }
 
     void replayTombstone(Uuid topicId, long globalBaseOffset) {
@@ -96,19 +168,48 @@ public class GlobalSequenceStateRegistry {
     }
 
     GlobalSequenceLookupResult lookup(GlobalSequenceLookupRequest request, long indexLogHighWatermark) {
+        GlobalSequenceIndexLookupPlan plan = prepareLookup(request, indexLogHighWatermark);
+        return plan.cachedResult().orElseThrow(() -> outOfRange(request, request.globalStartOffset()));
+    }
+
+    GlobalSequenceIndexLookupPlan prepareLookup(
+        GlobalSequenceLookupRequest request,
+        long indexLogHighWatermark
+    ) {
         Objects.requireNonNull(request, "request");
         GlobalSequenceState state = stateMap.get(request.topicId(), indexLogHighWatermark);
         if (state == null) {
             throw outOfRange(request, request.globalStartOffset());
         }
-        return state.lookup(
+        Optional<GlobalSequenceLookupResult> retainedResult = state.lookupRetained(
             request,
             indexLogHighWatermark,
             Math.min(request.maxIndexEntries(), maxLookupIndexEntries)
         );
+        if (retainedResult.isPresent()) {
+            return GlobalSequenceIndexLookupPlan.cached(retainedResult.get(), indexLogHighWatermark);
+        }
+
+        GlobalSequenceIndexCheckpoint checkpoint = checkpointIndex.floor(
+            request.topicId(),
+            request.globalStartOffset(),
+            indexLogHighWatermark
+        ).orElseThrow(() -> outOfRange(request, request.globalStartOffset()));
+        if (checkpoint.indexLogOffset() >= indexLogHighWatermark) {
+            throw outOfRange(request, request.globalStartOffset());
+        }
+        return GlobalSequenceIndexLookupPlan.scan(checkpoint.indexLogOffset(), indexLogHighWatermark);
     }
 
-    private static OffsetOutOfRangeException outOfRange(
+    int retainedAllocationCount(long epoch) {
+        return retainedAllocations.size(epoch);
+    }
+
+    int checkpointCount(Uuid topicId, long epoch) {
+        return checkpointIndex.numCheckpoints(topicId, epoch);
+    }
+
+    static OffsetOutOfRangeException outOfRange(
         GlobalSequenceLookupRequest request,
         long missingOffset
     ) {
@@ -128,6 +229,14 @@ public class GlobalSequenceStateRegistry {
 
     record PreparedAppend(GlobalSequenceIndexRecord indexRecord, boolean duplicate) { }
 
+    private record ReplayResult(boolean added, long allocationOrdinal) { }
+
+    private record RetainedAllocation(
+        Uuid topicId,
+        long allocationOrdinal,
+        GlobalSequenceIndexRecord indexRecord
+    ) { }
+
     public static class GlobalSequenceState {
         private final TimelineHashMap<Long, GlobalSequenceIndexRecord> sequenceByGlobalBaseOffset;
         // Allocations are replayed in increasing global-offset order, so their dense ordinals provide
@@ -136,6 +245,7 @@ public class GlobalSequenceStateRegistry {
         private final TimelineHashMap<PhysicalBatchId, GlobalSequenceIndexRecord> sequenceByPhysicalBatch;
         private final GlobalOffsetSequencer offsetSequencer;
         private final TimelineLong allocationCount;
+        private final TimelineLong firstRetainedAllocationOrdinal;
 
         GlobalSequenceState(SnapshotRegistry snapshotRegistry) {
             this.sequenceByGlobalBaseOffset = new TimelineHashMap<>(snapshotRegistry, 0);
@@ -143,6 +253,7 @@ public class GlobalSequenceStateRegistry {
             this.sequenceByPhysicalBatch = new TimelineHashMap<>(snapshotRegistry, 0);
             this.offsetSequencer = new BasicGlobalOffsetSequencer(snapshotRegistry);
             this.allocationCount = new TimelineLong(snapshotRegistry);
+            this.firstRetainedAllocationOrdinal = new TimelineLong(snapshotRegistry);
         }
 
         long nextGlobalOffset() {
@@ -170,7 +281,7 @@ public class GlobalSequenceStateRegistry {
             ), false);
         }
 
-        boolean replay(GlobalSequenceIndexRecord indexRecord) {
+        ReplayResult replay(GlobalSequenceIndexRecord indexRecord) {
             PhysicalBatchId physicalBatchId = new PhysicalBatchId(
                 indexRecord.topicId(),
                 indexRecord.partitionIndex(),
@@ -197,7 +308,7 @@ public class GlobalSequenceStateRegistry {
                 if (byPhysicalBatch == null || byGlobalBaseOffset == null) {
                     throw new IllegalStateException("Global sequence indexes are inconsistent for " + indexRecord);
                 }
-                return false;
+                return new ReplayResult(false, -1L);
             }
 
             validateReplayOrder(indexRecord);
@@ -216,7 +327,35 @@ public class GlobalSequenceStateRegistry {
             sequenceByAllocationOrdinal.put(allocationOrdinal, indexRecord);
             offsetSequencer.replayAllocation(indexRecord.globalBaseOffset(), indexRecord.recordCount());
             allocationCount.set(nextAllocationCount);
-            return true;
+            return new ReplayResult(true, allocationOrdinal);
+        }
+
+        void evict(long allocationOrdinal, GlobalSequenceIndexRecord indexRecord) {
+            GlobalSequenceIndexRecord ordered = sequenceByAllocationOrdinal.remove(allocationOrdinal);
+            if (!indexRecord.equals(ordered)) {
+                throw new IllegalStateException(
+                    "Global sequence allocation eviction order is inconsistent at ordinal " + allocationOrdinal
+                );
+            }
+
+            GlobalSequenceIndexRecord active = sequenceByGlobalBaseOffset.get(indexRecord.globalBaseOffset());
+            if (active != null) {
+                if (!indexRecord.equals(active)) {
+                    throw new IllegalStateException("Global sequence offset index is inconsistent during eviction");
+                }
+                sequenceByGlobalBaseOffset.remove(indexRecord.globalBaseOffset());
+                sequenceByPhysicalBatch.remove(new PhysicalBatchId(
+                    indexRecord.topicId(),
+                    indexRecord.partitionIndex(),
+                    indexRecord.partitionBaseOffset()
+                ));
+            }
+            if (firstRetainedAllocationOrdinal.get() != allocationOrdinal) {
+                throw new IllegalStateException(
+                    "Global sequence allocations must be evicted in topic allocation order"
+                );
+            }
+            firstRetainedAllocationOrdinal.set(Math.addExact(allocationOrdinal, 1L));
         }
 
         void replayTombstone(long globalBaseOffset) {
@@ -242,7 +381,7 @@ public class GlobalSequenceStateRegistry {
             sequenceByPhysicalBatch.remove(physicalBatchId);
         }
 
-        GlobalSequenceLookupResult lookup(
+        Optional<GlobalSequenceLookupResult> lookupRetained(
             GlobalSequenceLookupRequest request,
             long indexLogHighWatermark,
             int maxIndexEntries
@@ -250,8 +389,20 @@ public class GlobalSequenceStateRegistry {
             List<GlobalSequenceIndexRecord> matches = new ArrayList<>();
             long nextOffsetToCover = request.globalStartOffset();
             long count = allocationCount.get(indexLogHighWatermark);
+            long firstRetainedOrdinal = firstRetainedAllocationOrdinal.get(indexLogHighWatermark);
+            if (firstRetainedOrdinal >= count) {
+                return Optional.empty();
+            }
+            GlobalSequenceIndexRecord firstRetained = indexRecordAt(
+                firstRetainedOrdinal,
+                indexLogHighWatermark
+            );
+            if (request.globalStartOffset() < firstRetained.globalBaseOffset()) {
+                return Optional.empty();
+            }
             long firstOrdinal = findFirstCandidateOrdinal(
                 request.globalStartOffset(),
+                firstRetainedOrdinal,
                 count,
                 indexLogHighWatermark
             );
@@ -275,15 +426,20 @@ public class GlobalSequenceStateRegistry {
                 );
                 if (nextOffsetToCover == request.globalEndOffsetExclusive() ||
                     matches.size() == maxIndexEntries) {
-                    return new GlobalSequenceLookupResult(matches);
+                    return Optional.of(new GlobalSequenceLookupResult(matches));
                 }
             }
 
             throw outOfRange(request, nextOffsetToCover);
         }
 
-        private long findFirstCandidateOrdinal(long globalStartOffset, long count, long indexLogHighWatermark) {
-            long low = 0L;
+        private long findFirstCandidateOrdinal(
+            long globalStartOffset,
+            long firstRetainedOrdinal,
+            long count,
+            long indexLogHighWatermark
+        ) {
+            long low = firstRetainedOrdinal;
             long high = count;
             while (low < high) {
                 long middle = low + ((high - low) >>> 1);
@@ -294,7 +450,7 @@ public class GlobalSequenceStateRegistry {
                     high = middle;
                 }
             }
-            return low == 0L ? 0L : low - 1L;
+            return low == firstRetainedOrdinal ? firstRetainedOrdinal : low - 1L;
         }
 
         private GlobalSequenceIndexRecord indexRecordAt(long ordinal, long indexLogHighWatermark) {

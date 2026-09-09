@@ -79,6 +79,11 @@ public class GlobalSequenceCoordinatorConfig {
     public static final String INDEX_CACHE_MAX_ENTRIES_DOC = "The maximum number of committed global sequence " +
         "index records cached in memory per coordinator shard.";
 
+    public static final String INDEX_LOOKUP_MAX_SCAN_BYTES_CONFIG = "global.sequence.index.lookup.max.scan.bytes";
+    public static final int INDEX_LOOKUP_MAX_SCAN_BYTES_DEFAULT = 16 * 1024 * 1024;
+    public static final String INDEX_LOOKUP_MAX_SCAN_BYTES_DOC = "The maximum cumulative index-log bytes scanned " +
+        "by one global sequence lookup.";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(COMMIT_TIMEOUT_MS_CONFIG, INT, COMMIT_TIMEOUT_MS_DEFAULT, atLeast(1), HIGH, COMMIT_TIMEOUT_MS_DOC)
             .define(NUM_INDEX_PARTITIONS_CONFIG, INT, NUM_INDEX_PARTITIONS_DEFAULT, atLeast(1), HIGH, NUM_INDEX_PARTITIONS_DOC)
@@ -99,7 +104,9 @@ public class GlobalSequenceCoordinatorConfig {
             .define(INDEX_CHECKPOINT_LEVEL_FACTOR_CONFIG, INT, INDEX_CHECKPOINT_LEVEL_FACTOR_DEFAULT,
                     atLeast(2), HIGH, INDEX_CHECKPOINT_LEVEL_FACTOR_DOC)
             .define(INDEX_CACHE_MAX_ENTRIES_CONFIG, INT, INDEX_CACHE_MAX_ENTRIES_DEFAULT,
-                    atLeast(1), HIGH, INDEX_CACHE_MAX_ENTRIES_DOC);
+                    atLeast(1), HIGH, INDEX_CACHE_MAX_ENTRIES_DOC)
+            .define(INDEX_LOOKUP_MAX_SCAN_BYTES_CONFIG, INT, INDEX_LOOKUP_MAX_SCAN_BYTES_DEFAULT,
+                    atLeast(1), HIGH, INDEX_LOOKUP_MAX_SCAN_BYTES_DOC);
 
     private final int commitTimeoutMs;
     private final int numIndexPartitions;
@@ -112,6 +119,7 @@ public class GlobalSequenceCoordinatorConfig {
     private final int indexCheckpointInterval;
     private final int indexCheckpointLevelFactor;
     private final int indexCacheMaxEntries;
+    private final int indexLookupMaxScanBytes;
 
     public GlobalSequenceCoordinatorConfig(AbstractConfig config) {
         this.commitTimeoutMs = config.getInt(COMMIT_TIMEOUT_MS_CONFIG);
@@ -125,6 +133,7 @@ public class GlobalSequenceCoordinatorConfig {
         this.indexCheckpointInterval = config.getInt(INDEX_CHECKPOINT_INTERVAL_CONFIG);
         this.indexCheckpointLevelFactor = config.getInt(INDEX_CHECKPOINT_LEVEL_FACTOR_CONFIG);
         this.indexCacheMaxEntries = config.getInt(INDEX_CACHE_MAX_ENTRIES_CONFIG);
+        this.indexLookupMaxScanBytes = config.getInt(INDEX_LOOKUP_MAX_SCAN_BYTES_CONFIG);
     }
 
     public int commitTimeoutMs() {
@@ -169,5 +178,9 @@ public class GlobalSequenceCoordinatorConfig {
 
     public int indexCacheMaxEntries() {
         return indexCacheMaxEntries;
+    }
+
+    public int indexLookupMaxScanBytes() {
+        return indexLookupMaxScanBytes;
     }
 }

@@ -74,8 +74,12 @@ public class GlobalSequenceCoordinatorMetricsShard implements CoordinatorMetrics
     }
 
     public void incrementRetainedAllocations() {
+        addRetainedAllocations(1L);
+    }
+
+    public void addRetainedAllocations(long delta) {
         synchronized (retainedAllocations) {
-            retainedAllocations.increment();
+            retainedAllocations.set(Math.addExact(retainedAllocations.get(), delta));
         }
     }
 

@@ -63,6 +63,7 @@ class GlobalSequenceCoordinatorShardTest {
         shard = new GlobalSequenceCoordinatorShard(
             logContext,
             stateRegistry,
+            new GlobalSequenceIndexCache(config.indexCacheMaxEntries()),
             time,
             new MockCoordinatorTimer<>(time),
             config,

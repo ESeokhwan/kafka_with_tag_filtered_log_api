@@ -125,7 +125,14 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
 
             return new GlobalSequenceCoordinatorShard(
                     logContext,
-                    new GlobalSequenceStateRegistry(snapshotRegistry, config.maxLookupIndexEntries()),
+                    new GlobalSequenceStateRegistry(
+                        snapshotRegistry,
+                        config.maxLookupIndexEntries(),
+                        config.indexCacheMaxEntries(),
+                        config.indexCheckpointInterval(),
+                        config.indexCheckpointLevelFactor()
+                    ),
+                    new GlobalSequenceIndexCache(config.indexCacheMaxEntries()),
                     time,
                     timer,
                     config,
@@ -141,6 +148,8 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
 
     private final GlobalSequenceStateRegistry stateRegistry;
 
+    private final GlobalSequenceIndexCache indexCache;
+
     private final Time time;
 
     private final CoordinatorTimer<Void, CoordinatorRecord> timer;
@@ -154,6 +163,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     GlobalSequenceCoordinatorShard(
             LogContext logContext,
             GlobalSequenceStateRegistry stateRegistry,
+            GlobalSequenceIndexCache indexCache,
             Time time,
             CoordinatorTimer<Void, CoordinatorRecord> timer,
             GlobalSequenceCoordinatorConfig config,
@@ -162,6 +172,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     ) {
         this.log = logContext.logger(GlobalSequenceCoordinatorShard.class);
         this.stateRegistry = stateRegistry;
+        this.indexCache = indexCache;
         this.time = time;
         this.timer = timer;
         this.config = config;
@@ -188,7 +199,53 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     }
 
     GlobalSequenceLookupResult lookupIndex(GlobalSequenceLookupRequest request, long indexLogHighWatermark) {
-        GlobalSequenceLookupResult result = stateRegistry.lookup(request, indexLogHighWatermark);
+        GlobalSequenceIndexLookupPlan plan = prepareLookup(request, indexLogHighWatermark);
+        return plan.cachedResult().orElseThrow(() ->
+            GlobalSequenceStateRegistry.outOfRange(request, request.globalStartOffset())
+        );
+    }
+
+    GlobalSequenceIndexLookupPlan prepareLookup(
+        GlobalSequenceLookupRequest request,
+        long indexLogHighWatermark
+    ) {
+        GlobalSequenceIndexLookupPlan plan = stateRegistry.prepareLookup(request, indexLogHighWatermark);
+        if (plan.cachedResult().isPresent()) {
+            recordLookup(plan.cachedResult().get(), request);
+            return plan;
+        }
+
+        int maxIndexEntries = Math.min(request.maxIndexEntries(), config.maxLookupIndexEntries());
+        long cacheHitCount = indexCache.hitCount();
+        return indexCache.lookup(request, maxIndexEntries)
+            .map(result -> {
+                metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_HITS_SENSOR_NAME);
+                recordLookup(result, request);
+                return GlobalSequenceIndexLookupPlan.cached(result, indexLogHighWatermark);
+            })
+            .orElseGet(() -> {
+                if (indexCache.hitCount() == cacheHitCount) {
+                    metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_MISSES_SENSOR_NAME);
+                }
+                return plan;
+            });
+    }
+
+    GlobalSequenceLookupResult completeLookup(
+        GlobalSequenceLookupRequest request,
+        GlobalSequenceLookupResult result
+    ) {
+        long evictionsBefore = indexCache.evictionCount();
+        result.indexRecords().forEach(indexCache::put);
+        long evictions = indexCache.evictionCount() - evictionsBefore;
+        for (long index = 0; index < evictions; index++) {
+            metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_CACHE_EVICTIONS_SENSOR_NAME);
+        }
+        recordLookup(result, request);
+        return result;
+    }
+
+    private void recordLookup(GlobalSequenceLookupResult result, GlobalSequenceLookupRequest request) {
         metricsShard.record(
             GlobalSequenceCoordinatorMetrics.INDEX_LOOKUP_ENTRIES_SENSOR_NAME,
             result.indexRecords().size()
@@ -197,7 +254,6 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         if (lastRecord.globalEndOffsetExclusive() < request.globalEndOffsetExclusive()) {
             metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_LOOKUP_PAGINATIONS_SENSOR_NAME);
         }
-        return result;
     }
 
     private CoordinatorRecord toCoordinatorRecord(GlobalSequenceIndexRecord indexRecord) {
@@ -221,6 +277,7 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
     @Override
     public void onUnloaded() {
         timer.cancel(GLOBAL_SEQUENCE_EXPIRATION_KEY);
+        indexCache.clear();
         coordinatorMetrics.deactivateMetricsShard(metricsShard);
     }
 
@@ -242,22 +299,27 @@ public class GlobalSequenceCoordinatorShard implements CoordinatorShard<Coordina
         ApiMessageAndVersion value = record.value();
         if (value == null) {
             stateRegistry.replayTombstone(indexKey.topicId(), indexKey.globalOffset());
+            indexCache.remove(indexKey.topicId(), indexKey.globalOffset());
             return;
         }
         if (value.version() != 0 || !(value.message() instanceof GlobalSequenceIndexLogValue indexValue)) {
             throw new IllegalStateException("Unexpected global sequence index record value " + value);
         }
 
+        long retainedAllocationsBefore = stateRegistry.retainedAllocationCount(SnapshotRegistry.LATEST_EPOCH);
         boolean added = stateRegistry.replay(new GlobalSequenceIndexRecord(
             indexKey.topicId(),
             indexKey.globalOffset(),
             indexValue.recordsCount(),
             indexValue.partitionIndex(),
             indexValue.partitionOffset()
-        ));
+        ), offset);
         if (added) {
             if (metricsShard instanceof GlobalSequenceCoordinatorMetricsShard globalSequenceMetricsShard) {
-                globalSequenceMetricsShard.incrementRetainedAllocations();
+                globalSequenceMetricsShard.addRetainedAllocations(
+                    stateRegistry.retainedAllocationCount(SnapshotRegistry.LATEST_EPOCH) -
+                        retainedAllocationsBefore
+                );
             }
             metricsShard.record(GlobalSequenceCoordinatorMetrics.INDEX_ALLOCATIONS_SENSOR_NAME);
         }

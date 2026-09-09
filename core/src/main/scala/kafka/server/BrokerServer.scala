@@ -732,6 +732,10 @@ class BrokerServer(
       .withTimer(timer)
       .withLoader(loader)
       .withWriter(writer)
+      .withIndexLogReader(new ReplicaManagerGlobalSequenceIndexLogReader(
+        replicaManager,
+        config.globalSequenceCoordinatorConfig.indexLogReadMaxBytes()
+      ))
       .withCoordinatorRuntimeMetrics(new GlobalSequenceCoordinatorRuntimeMetrics(metrics))
       .withCoordinatorMetrics(new GlobalSequenceCoordinatorMetrics(KafkaYammerMetrics.defaultRegistry, metrics))
       .build()

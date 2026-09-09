@@ -42,6 +42,11 @@ public class GlobalSequenceCoordinatorMetrics extends CoordinatorMetrics impleme
     public static final String INDEX_ALLOCATIONS_SENSOR_NAME = "GlobalSequenceIndexAllocations";
     public static final String INDEX_LOOKUP_ENTRIES_SENSOR_NAME = "GlobalSequenceIndexLookupEntries";
     public static final String INDEX_LOOKUP_PAGINATIONS_SENSOR_NAME = "GlobalSequenceIndexLookupPaginations";
+    public static final String INDEX_CACHE_HITS_SENSOR_NAME = "GlobalSequenceIndexCacheHits";
+    public static final String INDEX_CACHE_MISSES_SENSOR_NAME = "GlobalSequenceIndexCacheMisses";
+    public static final String INDEX_CACHE_EVICTIONS_SENSOR_NAME = "GlobalSequenceIndexCacheEvictions";
+    public static final String INDEX_LOG_READS_SENSOR_NAME = "GlobalSequenceIndexLogReads";
+    public static final String INDEX_LOG_READ_BYTES_SENSOR_NAME = "GlobalSequenceIndexLogReadBytes";
 
     public static final com.yammer.metrics.core.MetricName NUM_RETAINED_ALLOCATIONS = getMetricName(
         "kafka.coordinator.globalsequence",
@@ -113,11 +118,71 @@ public class GlobalSequenceCoordinatorMetrics extends CoordinatorMetrics impleme
             )
         ));
 
+        Sensor cacheHits = meter(
+            INDEX_CACHE_HITS_SENSOR_NAME,
+            "index-cache-hit",
+            "global sequence index cache hits"
+        );
+        Sensor cacheMisses = meter(
+            INDEX_CACHE_MISSES_SENSOR_NAME,
+            "index-cache-miss",
+            "global sequence index cache misses"
+        );
+        Sensor cacheEvictions = meter(
+            INDEX_CACHE_EVICTIONS_SENSOR_NAME,
+            "index-cache-eviction",
+            "global sequence index cache evictions"
+        );
+        Sensor indexLogReads = meter(
+            INDEX_LOG_READS_SENSOR_NAME,
+            "index-log-read",
+            "bounded global sequence index log reads"
+        );
+        Sensor indexLogReadBytes = metrics.sensor(INDEX_LOG_READ_BYTES_SENSOR_NAME);
+        indexLogReadBytes.add(
+            metrics.metricName(
+                "index-log-read-bytes-avg",
+                METRICS_GROUP,
+                "The average bytes returned by one bounded index log read."
+            ),
+            new Avg()
+        );
+        indexLogReadBytes.add(
+            metrics.metricName(
+                "index-log-read-bytes-max",
+                METRICS_GROUP,
+                "The maximum bytes returned by one bounded index log read."
+            ),
+            new Max()
+        );
+
         globalSensors = Map.copyOf(Utils.mkMap(
             Utils.mkEntry(INDEX_ALLOCATIONS_SENSOR_NAME, allocations),
             Utils.mkEntry(INDEX_LOOKUP_ENTRIES_SENSOR_NAME, lookupEntries),
-            Utils.mkEntry(INDEX_LOOKUP_PAGINATIONS_SENSOR_NAME, lookupPaginations)
+            Utils.mkEntry(INDEX_LOOKUP_PAGINATIONS_SENSOR_NAME, lookupPaginations),
+            Utils.mkEntry(INDEX_CACHE_HITS_SENSOR_NAME, cacheHits),
+            Utils.mkEntry(INDEX_CACHE_MISSES_SENSOR_NAME, cacheMisses),
+            Utils.mkEntry(INDEX_CACHE_EVICTIONS_SENSOR_NAME, cacheEvictions),
+            Utils.mkEntry(INDEX_LOG_READS_SENSOR_NAME, indexLogReads),
+            Utils.mkEntry(INDEX_LOG_READ_BYTES_SENSOR_NAME, indexLogReadBytes)
         ));
+    }
+
+    private Sensor meter(String sensorName, String metricPrefix, String description) {
+        Sensor sensor = metrics.sensor(sensorName);
+        sensor.add(new Meter(
+            metrics.metricName(
+                metricPrefix + "-rate",
+                METRICS_GROUP,
+                "The rate of " + description + "."
+            ),
+            metrics.metricName(
+                metricPrefix + "-total",
+                METRICS_GROUP,
+                "The total number of " + description + "."
+            )
+        ));
+        return sensor;
     }
 
     private void registerGauges() {
@@ -140,7 +205,12 @@ public class GlobalSequenceCoordinatorMetrics extends CoordinatorMetrics impleme
         List.of(
             INDEX_ALLOCATIONS_SENSOR_NAME,
             INDEX_LOOKUP_ENTRIES_SENSOR_NAME,
-            INDEX_LOOKUP_PAGINATIONS_SENSOR_NAME
+            INDEX_LOOKUP_PAGINATIONS_SENSOR_NAME,
+            INDEX_CACHE_HITS_SENSOR_NAME,
+            INDEX_CACHE_MISSES_SENSOR_NAME,
+            INDEX_CACHE_EVICTIONS_SENSOR_NAME,
+            INDEX_LOG_READS_SENSOR_NAME,
+            INDEX_LOG_READ_BYTES_SENSOR_NAME
         ).forEach(metrics::removeSensor);
     }
 
@@ -181,5 +251,19 @@ public class GlobalSequenceCoordinatorMetrics extends CoordinatorMetrics impleme
         return shards.values().stream()
             .mapToLong(GlobalSequenceCoordinatorMetricsShard::numRetainedAllocations)
             .sum();
+    }
+
+    public void record(String sensorName) {
+        Sensor sensor = globalSensors.get(sensorName);
+        if (sensor != null) {
+            sensor.record();
+        }
+    }
+
+    public void record(String sensorName, double value) {
+        Sensor sensor = globalSensors.get(sensorName);
+        if (sensor != null) {
+            sensor.record(value);
+        }
     }
 }

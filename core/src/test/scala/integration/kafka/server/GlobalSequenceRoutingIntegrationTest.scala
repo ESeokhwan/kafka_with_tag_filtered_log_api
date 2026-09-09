@@ -108,6 +108,14 @@ class GlobalSequenceRoutingIntegrationTest {
       new ClusterConfigProperty(
         key = GlobalSequenceCoordinatorConfig.NUM_INDEX_PARTITIONS_CONFIG,
         value = "1"
+      ),
+      new ClusterConfigProperty(
+        key = GlobalSequenceCoordinatorConfig.INDEX_CACHE_MAX_ENTRIES_CONFIG,
+        value = "1"
+      ),
+      new ClusterConfigProperty(
+        key = GlobalSequenceCoordinatorConfig.INDEX_CHECKPOINT_INTERVAL_CONFIG,
+        value = "1"
       )
     )
   )

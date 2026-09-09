@@ -475,6 +475,87 @@ class GlobalSequenceStateRegistryTest {
         );
     }
 
+    @Test
+    void testEvictedRangeProducesSparseCheckpointScanPlan() {
+        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+        GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(
+            snapshotRegistry,
+            10,
+            2,
+            1,
+            2
+        );
+        GlobalSequenceIndexRecord first = record(TOPIC_ID, 0L, 1, 0, 10L);
+        GlobalSequenceIndexRecord second = record(TOPIC_ID, 1L, 1, 0, 11L);
+        GlobalSequenceIndexRecord third = record(TOPIC_ID, 2L, 1, 0, 12L);
+        registry.replay(first, 100L);
+        registry.replay(second, 101L);
+        registry.replay(third, 102L);
+        snapshotRegistry.idempotentCreateSnapshot(103L);
+
+        assertEquals(2, registry.retainedAllocationCount(SnapshotRegistry.LATEST_EPOCH));
+        assertEquals(
+            GlobalSequenceIndexLookupPlan.scan(100L, 103L),
+            registry.prepareLookup(
+                new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 1L),
+                103L
+            )
+        );
+        assertEquals(
+            GlobalSequenceIndexLookupPlan.cached(
+                new GlobalSequenceLookupResult(List.of(third)),
+                103L
+            ),
+            registry.prepareLookup(
+                new GlobalSequenceLookupRequest(TOPIC_ID, 2L, 3L),
+                103L
+            )
+        );
+        assertEquals(3L, registry.getState(TOPIC_ID).nextGlobalOffset());
+
+        GlobalSequenceStateRegistry.PreparedAppend expiredRetry = registry.prepareAppend(
+            request(TOPIC_ID, 0, 10L, 1)
+        );
+        assertFalse(expiredRetry.duplicate());
+        assertEquals(3L, expiredRetry.indexRecord().globalBaseOffset());
+    }
+
+    @Test
+    void testSnapshotRollbackRestoresBoundedRecentWindowAndCheckpoints() {
+        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+        GlobalSequenceStateRegistry registry = new GlobalSequenceStateRegistry(
+            snapshotRegistry,
+            10,
+            1,
+            1,
+            2
+        );
+        GlobalSequenceIndexRecord first = record(TOPIC_ID, 0L, 1, 0, 10L);
+        registry.replay(first, 100L);
+        snapshotRegistry.idempotentCreateSnapshot(0L);
+
+        registry.replay(record(TOPIC_ID, 1L, 1, 0, 11L), 101L);
+        assertThrows(
+            OffsetOutOfRangeException.class,
+            () -> registry.lookup(
+                new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 1L),
+                SnapshotRegistry.LATEST_EPOCH
+            )
+        );
+
+        snapshotRegistry.revertToSnapshot(0L);
+
+        assertEquals(1, registry.retainedAllocationCount(SnapshotRegistry.LATEST_EPOCH));
+        assertEquals(
+            new GlobalSequenceLookupResult(List.of(first)),
+            registry.lookup(
+                new GlobalSequenceLookupRequest(TOPIC_ID, 0L, 1L),
+                SnapshotRegistry.LATEST_EPOCH
+            )
+        );
+        assertEquals(1, registry.checkpointCount(TOPIC_ID, SnapshotRegistry.LATEST_EPOCH));
+    }
+
     private static GlobalSequenceStateRegistry newRegistry() {
         return new GlobalSequenceStateRegistry(new SnapshotRegistry(new LogContext()));
     }
